@@ -11,7 +11,7 @@ use crate::util::errors::{
 	WrappedError,
 };
 use crate::util::input::prompt_placeholder;
-use crate::{debug, info, log, spanf, trace, warning};
+use crate::log;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::{FutureExt, TryFutureExt};
