@@ -243,9 +243,15 @@ export class ChatLatencyAudit {
 			if (!context.networkEndTime) {
 				context.networkEndTime = performance.now();
 			}
-			if (dnsTime !== undefined) context.dnsTime = dnsTime;
-			if (tlsTime !== undefined) context.tlsTime = tlsTime;
-			if (httpTime !== undefined) context.httpTime = httpTime;
+			if (dnsTime !== undefined) {
+				context.dnsTime = dnsTime;
+			}
+			if (tlsTime !== undefined) {
+				context.tlsTime = tlsTime;
+			}
+			if (httpTime !== undefined) {
+				context.httpTime = httpTime;
+			}
 		}
 	}
 
@@ -306,7 +312,9 @@ export class ChatLatencyAudit {
 	 */
 	getMetrics(requestId: string): ChatLatencyMetrics | null {
 		const context = this.contexts.get(requestId);
-		if (!context) return null;
+		if (!context) {
+			return null;
+		}
 
 		const now = performance.now();
 
@@ -468,7 +476,9 @@ export class ChatLatencyAudit {
 		console.log(`Provider: ${metrics.providerName}/${metrics.modelName}`);
 		console.log(`TTFS: ${metrics.ttfs.toFixed(2)}ms`);
 		console.log(`TTS: ${metrics.tts.toFixed(2)}ms`);
-		if (metrics.routerDecisionTime > 0) console.log(`Router Decision: ${metrics.routerDecisionTime.toFixed(2)}ms`);
+		if (metrics.routerDecisionTime > 0) {
+			console.log(`Router Decision: ${metrics.routerDecisionTime.toFixed(2)}ms`);
+		}
 		console.log(`Network Latency: ${metrics.networkLatency.toFixed(2)}ms`);
 		console.log(`Prompt Assembly: ${metrics.promptAssemblyTime.toFixed(2)}ms`);
 		console.log(`Tokenization: ${metrics.tokenizationTime.toFixed(2)}ms`);
@@ -477,9 +487,25 @@ export class ChatLatencyAudit {
 		console.log(`Output Tokens: ${metrics.outputTokens}`);
 		console.log(`Context Size: ${metrics.contextSize} chars (truncated: ${metrics.contextTruncated})`);
 		console.log(`Render FPS: ${metrics.renderFPS.toFixed(1)} (dropped: ${metrics.droppedFrames})`);
-		if (metrics.dnsTime) console.log(`DNS: ${metrics.dnsTime.toFixed(2)}ms`);
-		if (metrics.tlsTime) console.log(`TLS: ${metrics.tlsTime.toFixed(2)}ms`);
-		if (metrics.httpTime) console.log(`HTTP: ${metrics.httpTime.toFixed(2)}ms`);
+		if (metrics.dnsTime) {
+			console.log(`DNS: ${metrics.dnsTime.toFixed(2)}ms`);
+		}
+		if (metrics.tlsTime) {
+			console.log(`TLS: ${metrics.tlsTime.toFixed(2)}ms`);
+		}
+		if (metrics.httpTime) {
+			console.log(`HTTP: ${metrics.httpTime.toFixed(2)}ms`);
+		}
+		if (metrics.totalToolTurnMs !== undefined) {
+			console.log(`Tool Turn Timings (avg):`);
+			console.log(`  Prompt Prepare: ${metrics.promptPrepareMs?.toFixed(2)}ms`);
+			console.log(`  Token Count: ${metrics.tokenCountMs?.toFixed(2)}ms`);
+			console.log(`  Tool Schema Build: ${metrics.toolSchemaBuildMs?.toFixed(2)}ms`);
+			console.log(`  LLM Network: ${metrics.llmNetworkMs?.toFixed(2)}ms`);
+			console.log(`  Tool Execute: ${metrics.toolExecuteMs?.toFixed(2)}ms`);
+			console.log(`  Tool Result Inject: ${metrics.toolResultInjectMs?.toFixed(2)}ms`);
+			console.log(`  Total: ${metrics.totalToolTurnMs.toFixed(2)}ms`);
+		}
 		console.groupEnd();
 
 		// Auto-collect for aggregate reporting
@@ -534,7 +560,9 @@ export class ChatLatencyAudit {
 		lines.push(`Provider: ${metrics.providerName}/${metrics.modelName}`);
 		lines.push(`TTFS: ${metrics.ttfs.toFixed(2)}ms`);
 		lines.push(`TTS: ${metrics.tts.toFixed(2)}ms`);
-		if (metrics.routerDecisionTime > 0) lines.push(`Router Decision: ${metrics.routerDecisionTime.toFixed(2)}ms`);
+		if (metrics.routerDecisionTime > 0) {
+			lines.push(`Router Decision: ${metrics.routerDecisionTime.toFixed(2)}ms`);
+		}
 		lines.push(`Network: ${metrics.networkLatency.toFixed(2)}ms`);
 		lines.push(`Prompt Assembly: ${metrics.promptAssemblyTime.toFixed(2)}ms`);
 		lines.push(`Tokenization: ${metrics.tokenizationTime.toFixed(2)}ms`);

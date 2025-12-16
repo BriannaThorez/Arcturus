@@ -46,5 +46,14 @@ export interface ChatLatencyMetrics {
 	// Request info
 	requestId: string;
 	timestamp: number;
+
+	// Tool turn timing metrics (Part A - instrumentation)
+	promptPrepareMs?: number; // Time to prepare prompt (ms)
+	tokenCountMs?: number; // Time to count tokens (ms)
+	toolSchemaBuildMs?: number; // Time to build tool schemas (ms)
+	llmNetworkMs?: number; // Time for LLM network request (ms)
+	toolExecuteMs?: number; // Time to execute tools (ms)
+	toolResultInjectMs?: number; // Time to inject tool results (ms)
+	totalToolTurnMs?: number; // Total time for tool turn (ms)
 }
 

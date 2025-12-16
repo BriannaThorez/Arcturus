@@ -32,6 +32,7 @@ import { INotificationService, Severity } from '../../../../platform/notificatio
 import { truncate } from '../../../../base/common/strings.js';
 import { THREAD_STORAGE_KEY } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
+import { PreparedPromptState } from './preparedPromptState.js';
 import { timeout } from '../../../../base/common/async.js';
 import { deepClone } from '../../../../base/common/objects.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
@@ -2744,6 +2745,12 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 		// Flag to prevent further tool calls after file read limit is exceeded
 		let fileReadLimitExceeded = false
 
+		// Part B: Incremental Prompt Pipeline - track prepared prompt state across tool turns
+		let preparedPromptState: PreparedPromptState | null = null;
+
+		// Part A: Track tool execution timing across tool turns
+		let lastToolExecuteMs = 0;
+
 		// tool use loop
 		while (shouldSendAnotherMessage) {
 			// CRITICAL: Check for maximum iterations to prevent infinite loops
@@ -2889,7 +2896,12 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 			}
 			chatLatencyAudit.markPromptAssemblyStart(finalRequestId)
 
-			// PERFORMANCE: Check cache for prepared messages before expensive preparation
+			// Part B: Incremental Prompt Pipeline - use PreparedPromptState for tool turns
+			const timingStart = performance.now();
+			let promptPrepareMs = 0;
+			let tokenCountMs = 0;
+			let toolSchemaBuildMs = 0;
+
 			// Get repoIndexer results if promise is available (for cache key)
 			let repoIndexerResults: { results: string[]; metrics: any } | null | undefined = undefined;
 			if (repoIndexerPromise) {
@@ -2900,52 +2912,153 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 				}
 			}
 
-			const cacheKey = this._getMessagePrepCacheKey(preprocessedMessages, modelSelection, chatMode, repoIndexerResults);
-			const cached = this._messagePrepCache.get(cacheKey);
-			const now = Date.now();
-
 			let messages: any[];
 			let separateSystemMessage: string | undefined;
 			let promptTokens: number;
 			let contextSize: number;
 
-			// Use cached result if available and not expired
-			if (cached && (now - cached.timestamp) < ChatThreadService.MESSAGE_PREP_CACHE_TTL) {
-				messages = cached.messages;
-				separateSystemMessage = cached.separateSystemMessage;
-				promptTokens = cached.tokenCount;
-				contextSize = cached.contextSize;
-			} else {
-				// Prepare messages (expensive operation)
-				const prepResult = await this._convertToLLMMessagesService.prepareLLMChatMessages({
-					chatMessages: preprocessedMessages,
-					modelSelection,
-					chatMode,
-					repoIndexerPromise: repoIndexerResults ? Promise.resolve(repoIndexerResults) : repoIndexerPromise
-				});
-				messages = prepResult.messages;
-				separateSystemMessage = prepResult.separateSystemMessage;
+			// Check if we can use incremental PreparedPromptState (on tool turns after first iteration)
+			const isToolTurn = nMessagesSent > 1 && preparedPromptState !== null;
+			const canUseIncremental = isToolTurn &&
+				preparedPromptState.modelSelection.providerName === modelSelection?.providerName &&
+				preparedPromptState.modelSelection.modelName === modelSelection?.modelName &&
+				preparedPromptState.chatMode === chatMode;
 
-				// Compute token count and context size
-				const tokenResult = this._computeTokenCount(messages);
-				promptTokens = tokenResult.tokenCount;
-				contextSize = tokenResult.contextSize;
+			if (canUseIncremental) {
+				// Part B: Incremental update - append tool results without full rebuild
+				const toolResultsStart = performance.now();
 
-				// Cache result (with LRU eviction)
-				if (this._messagePrepCache.size >= ChatThreadService.MESSAGE_PREP_CACHE_MAX_SIZE) {
-					// Remove oldest entry (simple FIFO eviction)
-					const firstKey = this._messagePrepCache.keys().next().value;
-					if (firstKey !== undefined) {
-						this._messagePrepCache.delete(firstKey);
+				// Get tool results from previous turn (last tool messages in thread)
+				const thread = this.state.allThreads[threadId];
+				const toolResults: Array<{ role: 'tool'; content: string; tool_call_id: string }> = [];
+				if (thread) {
+					// Find tool messages added since last assistant message
+					let lastAssistantIdx = -1;
+					for (let i = thread.messages.length - 1; i >= 0; i--) {
+						if (thread.messages[i].role === 'assistant') {
+							lastAssistantIdx = i;
+							break;
+						}
+					}
+
+					// Collect tool results after last assistant message
+					for (let i = lastAssistantIdx + 1; i < thread.messages.length; i++) {
+						const msg = thread.messages[i];
+						if (msg.role === 'tool') {
+							const toolMsg = msg as ToolMessage<ToolName>;
+							if (toolMsg.type === 'success' || toolMsg.type === 'tool_error') {
+								toolResults.push({
+									role: 'tool',
+									content: toolMsg.content,
+									tool_call_id: toolMsg.id,
+								});
+							}
+						}
 					}
 				}
-				this._messagePrepCache.set(cacheKey, {
-					messages,
-					separateSystemMessage,
-					tokenCount: promptTokens,
-					contextSize,
-					timestamp: now
-				});
+
+				// Get last assistant message with tool_calls (if any)
+				// For now, we'll need to reconstruct this from the LLM response format
+				// This is a simplified version - in practice we'd track this more carefully
+				const assistantMessage: any = toolResults.length > 0 ? {
+					role: 'assistant',
+					content: '',
+					tool_calls: toolResults.map(tr => ({
+						type: 'function',
+						id: tr.tool_call_id,
+						function: {
+							name: '', // Would need to track this
+							arguments: '{}',
+						},
+					})),
+				} : undefined;
+
+				// Append tool results incrementally
+				if (toolResults.length > 0 && assistantMessage) {
+					preparedPromptState.appendToolResults(assistantMessage, toolResults);
+				}
+
+				// Build final messages from incremental state
+				messages = preparedPromptState.buildFinalMessages();
+				separateSystemMessage = preparedPromptState.separateSystemMessage;
+				promptTokens = preparedPromptState.baseTokenCount;
+				contextSize = preparedPromptState.baseContextSize;
+
+				promptPrepareMs = performance.now() - toolResultsStart;
+				tokenCountMs = 0; // Already computed incrementally
+			} else {
+				// First iteration or state invalid - do full preparation
+				const fullPrepStart = performance.now();
+
+				const cacheKey = this._getMessagePrepCacheKey(preprocessedMessages, modelSelection, chatMode, repoIndexerResults);
+				const cached = this._messagePrepCache.get(cacheKey);
+				const now = Date.now();
+
+				// Use cached result if available and not expired
+				if (cached && (now - cached.timestamp) < ChatThreadService.MESSAGE_PREP_CACHE_TTL) {
+					messages = cached.messages;
+					separateSystemMessage = cached.separateSystemMessage;
+					promptTokens = cached.tokenCount;
+					contextSize = cached.contextSize;
+					promptPrepareMs = 0; // Cached, no prep time
+				} else {
+					// Prepare messages (expensive operation)
+					const prepResult = await this._convertToLLMMessagesService.prepareLLMChatMessages({
+						chatMessages: preprocessedMessages,
+						modelSelection,
+						chatMode,
+						repoIndexerPromise: repoIndexerResults ? Promise.resolve(repoIndexerResults) : repoIndexerPromise
+					});
+					messages = prepResult.messages;
+					separateSystemMessage = prepResult.separateSystemMessage;
+
+					// Compute token count and context size
+					const tokenCountStart = performance.now();
+					const tokenResult = this._computeTokenCount(messages);
+					promptTokens = tokenResult.tokenCount;
+					contextSize = tokenResult.contextSize;
+					tokenCountMs = performance.now() - tokenCountStart;
+
+					// Create PreparedPromptState for future tool turns
+					if (modelSelection && modelSelection.providerName !== 'auto') {
+						const { getModelCapabilities } = await import('../common/modelCapabilities.js');
+						const capabilities = getModelCapabilities(modelSelection.providerName, modelSelection.modelName, overridesOfModel);
+
+						// Extract base messages (without tool results) for PreparedPromptState
+						// For now, use all messages - we'll refine this to separate base from tool results
+						const baseMessages = messages.filter(m => m.role !== 'tool');
+
+						preparedPromptState = new PreparedPromptState({
+							baseMessages,
+							separateSystemMessage,
+							baseTokenCount: promptTokens,
+							baseContextSize: contextSize,
+							toolSchemaCache: null, // Will be populated in Part C
+							modelSelection,
+							chatMode,
+							providerName: modelSelection.providerName,
+							specialToolFormat: capabilities.specialToolFormat,
+						});
+					}
+
+					// Cache result (with LRU eviction)
+					if (this._messagePrepCache.size >= ChatThreadService.MESSAGE_PREP_CACHE_MAX_SIZE) {
+						// Remove oldest entry (simple FIFO eviction)
+						const firstKey = this._messagePrepCache.keys().next().value;
+						if (firstKey !== undefined) {
+							this._messagePrepCache.delete(firstKey);
+						}
+					}
+					this._messagePrepCache.set(cacheKey, {
+						messages,
+						separateSystemMessage,
+						tokenCount: promptTokens,
+						contextSize,
+						timestamp: now
+					});
+
+					promptPrepareMs = performance.now() - fullPrepStart;
+				}
 			}
 
 			// CRITICAL: Validate that messages are not empty before sending to API
@@ -3124,6 +3237,8 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 
 				// Track network request start (when we actually send to the LLM)
 				chatLatencyAudit.markNetworkStart(finalRequestId)
+				const llmNetworkStart = performance.now();
+
 				// Track network start time for timeout fallback (if no tokens arrive)
 				const networkTimeout = setTimeout(() => {
 					// Fallback: if no tokens arrive within 30s, mark network end anyway
@@ -3212,7 +3327,26 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 						const textToCount = fullText || fullReasoning || '';
 						// More accurate token estimation: account for markdown, code blocks, etc.
 						const outputTokens = textToCount.length > 0 ? Math.max(1, Math.ceil(textToCount.length / 3.5)) : 0
+						const llmNetworkMs = performance.now() - llmNetworkStart;
 						chatLatencyAudit.markStreamComplete(finalRequestId, outputTokens)
+
+						// Part A: Record tool turn timing if this was a tool turn
+						if (nMessagesSent > 1 && timingStart) {
+							const toolResultInjectMs = 0; // Tool results injected during prep
+							const totalToolTurnMs = performance.now() - timingStart;
+							chatLatencyAudit.recordToolTurnTiming(finalRequestId, {
+								promptPrepareMs,
+								tokenCountMs,
+								toolSchemaBuildMs,
+								llmNetworkMs,
+								toolExecuteMs: lastToolExecuteMs, // Tool execution from previous turn
+								toolResultInjectMs,
+								totalToolTurnMs,
+							});
+							// Reset for next turn
+							lastToolExecuteMs = 0;
+						}
+
 						// Log metrics for debugging
 						// PERFORMANCE: Only compute metrics if audit is enabled (metrics computation has overhead)
 						const metrics = auditEnabled ? chatLatencyAudit.completeRequest(finalRequestId) : null
@@ -3662,6 +3796,9 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 
 				// call tool if there is one
 				if (toolCall) {
+					// Part A: Track tool execution timing
+					const toolExecuteStart = performance.now();
+
 					// Skip tool execution if file read limit was exceeded in a previous iteration
 					if (fileReadLimitExceeded) {
 						// Don't execute any more tools - just continue to final LLM call
@@ -3713,6 +3850,8 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 					const mcpTool = mcpTools?.find(t => t.name === toolCall.name)
 
 					const { awaitingUserApproval, interrupted } = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams })
+					lastToolExecuteMs = performance.now() - toolExecuteStart;
+
 					if (interrupted) {
 						this._setStreamState(threadId, undefined)
 						if (activePlanTracking?.currentStep) {
