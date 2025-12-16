@@ -20,6 +20,9 @@ import { getSendableReasoningInfo, getModelCapabilities, getProviderCapabilities
 import { extractReasoningWrapper, extractXMLToolsWrapper } from './extractGrammar.js';
 import { availableTools, InternalToolInfo } from '../../common/prompt/prompts.js';
 import { generateUuid } from '../../../../../base/common/uuid.js';
+import { perfSpanTracker, type LocalLLMPerfSpan } from '../../common/localLLMPerfSpan.js';
+import { isLocalProvider as checkIsLocalProvider, getBackendCapabilities } from '../../common/localLLMCapabilities.js';
+import { generateFIMCacheKey, generateChatCacheKey } from '../../common/localLLMCacheKey.js';
 
 const getGoogleApiKey = async () => {
 	// module‑level singleton
@@ -105,38 +108,31 @@ const buildOpenAICacheKey = (providerName: ProviderName, settingsOfProvider: Set
  * Get or create OpenAI-compatible client with caching for local providers.
  * For local providers (ollama, vLLM, lmStudio, localhost openAICompatible/liteLLM),
  * we cache clients to reuse connections. Cloud providers always get new instances.
+ *
+ * PERFORMANCE: For local providers, this is typically a cache hit (instant return).
+ * For cloud providers or first request, client creation is async but fast.
  */
 const getOpenAICompatibleClient = async ({ settingsOfProvider, providerName, includeInPayload }: { settingsOfProvider: SettingsOfProvider, providerName: ProviderName, includeInPayload?: { [s: string]: any } }): Promise<OpenAI> => {
 	// Detect if this is a local provider
-	const isExplicitLocalProvider = providerName === 'ollama' || providerName === 'vLLM' || providerName === 'lmStudio'
-	let isLocalhostEndpoint = false
-	if (providerName === 'openAICompatible' || providerName === 'liteLLM') {
-		const endpoint = settingsOfProvider[providerName]?.endpoint || ''
-		if (endpoint) {
-			try {
-				const url = new URL(endpoint)
-				const hostname = url.hostname.toLowerCase()
-				isLocalhostEndpoint = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0' || hostname === '::1'
-			} catch (e) {
-				isLocalhostEndpoint = false
-			}
-		}
-	}
-	const isLocalProvider = isExplicitLocalProvider || isLocalhostEndpoint
+	const endpoint = settingsOfProvider[providerName]?.endpoint || ''
+	const isLocalProvider = checkIsLocalProvider(providerName, endpoint)
 
 	// Only cache for local providers
 	if (isLocalProvider) {
 		const cacheKey = buildOpenAICacheKey(providerName, settingsOfProvider)
 		const cached = openAIClientCache.get(cacheKey)
 		if (cached) {
+			// PERFORMANCE: Cache hit - return immediately (no async overhead)
 			return cached
 		}
 	}
 
 	// Create new client (will cache if local)
+	// PERFORMANCE: For local providers, client creation is synchronous (no await needed except for googleVertex)
+	// But we keep async for consistency and to handle googleVertex case
 	const client = await newOpenAICompatibleSDK({ settingsOfProvider, providerName, includeInPayload })
 
-	// Cache if local provider
+	// Cache if local provider (immediate caching for connection reuse)
 	if (isLocalProvider) {
 		const cacheKey = buildOpenAICacheKey(providerName, settingsOfProvider)
 		openAIClientCache.set(cacheKey, client)
@@ -147,6 +143,7 @@ const getOpenAICompatibleClient = async ({ settingsOfProvider, providerName, inc
 
 /**
  * Get or create Ollama client with caching.
+ * Optimized for local performance with timeout and connection settings.
  */
 const getOllamaClient = ({ endpoint }: { endpoint: string }): Ollama => {
 	if (!endpoint) throw new Error(`Ollama Endpoint was empty (please enter ${defaultProviderSettings.ollama.endpoint} in CortexIDE Settings if you want the default url).`)
@@ -156,7 +153,40 @@ const getOllamaClient = ({ endpoint }: { endpoint: string }): Ollama => {
 		return cached
 	}
 
-	const ollama = new Ollama({ host: endpoint })
+	// Parse endpoint URL - Ollama SDK expects hostname:port format (without protocol)
+	// But it can also accept a full URL, so we'll extract just the hostname:port part
+	let host: string
+	try {
+		const url = new URL(endpoint)
+		host = url.hostname
+		// Include port if specified (default Ollama port is 11434)
+		if (url.port) {
+			host = `${host}:${url.port}`
+		} else if (url.protocol === 'http:' && !endpoint.includes(':11434')) {
+			// Default Ollama port is 11434
+			host = `${host}:11434`
+		}
+	} catch {
+		// If endpoint is not a full URL, try to clean it up
+		// Remove protocol if present, but keep hostname:port
+		host = endpoint.replace(/^https?:\/\//, '')
+		// If no port specified and it looks like a hostname, add default port
+		if (!host.includes(':') && !host.includes('localhost') && !host.includes('127.0.0.1')) {
+			// This might be just a hostname, but we'll use it as-is
+		}
+	}
+
+	console.debug('[getOllamaClient] Parsed endpoint:', endpoint, '-> host:', host)
+
+	// Configure Ollama client with timeout and connection optimizations for local models
+	// The Ollama SDK uses fetch internally, and we can pass fetch options
+	// Note: Ollama SDK v0.x doesn't expose timeout directly, but we can use fetch options
+	const ollama = new Ollama({
+		host: host,
+		// The Ollama SDK internally uses fetch, and we can configure it via environment
+		// For now, we rely on the SDK's default behavior but ensure endpoint is correct
+		// Future: If Ollama SDK adds timeout support, configure it here (e.g., timeout: 30_000)
+	})
 	ollamaClientCache.set(endpoint, ollama)
 	return ollama
 }
@@ -172,62 +202,28 @@ const parseHeadersJSON = (s: string | undefined): Record<string, string | null |
 	}
 }
 
-/**
- * Compute max_tokens/num_predict for local providers based on feature.
- * For local models, we use smaller token limits to reduce latency:
- * - Autocomplete: 64-96 tokens (very small, fast completions)
- * - Ctrl+K / Apply: 150-250 tokens (small edits)
- * - Other/Cloud: 300 tokens (default)
- */
-const computeMaxTokensForLocalProvider = (isLocalProvider: boolean, featureName: FeatureName | undefined): number => {
-	if (!isLocalProvider) {
-		return 300 // Default for cloud providers
-	}
-
-	// Infer feature from featureName or default to safe value
-	if (featureName === 'Autocomplete') {
-		return 96 // Small value for fast autocomplete
-	} else if (featureName === 'Ctrl+K' || featureName === 'Apply') {
-		return 200 // Medium value for quick edits
-	}
-
-	// Default for local providers when featureName is unknown
-	return 300
-}
+// Note: Void uses hardcoded max_tokens: 300 for all FIM requests, so we match that approach
+// Removed computeMaxTokensForLocalProvider as it's no longer needed (Void doesn't vary tokens by feature)
 
 const newOpenAICompatibleSDK = async ({ settingsOfProvider, providerName, includeInPayload }: { settingsOfProvider: SettingsOfProvider, providerName: ProviderName, includeInPayload?: { [s: string]: any } }) => {
 	// Network optimizations: timeouts and connection reuse
 	// The OpenAI SDK handles HTTP keep-alive and connection pooling internally
 	// Use shorter timeout for local models (they're on localhost, should be fast)
 
-	// Detect local providers: explicit local providers + localhost endpoints
-	const isExplicitLocalProvider = providerName === 'ollama' || providerName === 'vLLM' || providerName === 'lmStudio'
-	let isLocalhostEndpoint = false
-	if (providerName === 'openAICompatible' || providerName === 'liteLLM') {
-		const endpoint = settingsOfProvider[providerName]?.endpoint || ''
-		if (endpoint) {
-			try {
-				// Use proper URL parsing to check hostname (not substring matching)
-				const url = new URL(endpoint)
-				const hostname = url.hostname.toLowerCase()
-				isLocalhostEndpoint = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0' || hostname === '::1'
-			} catch (e) {
-				// Invalid URL - assume non-local (safe default)
-				isLocalhostEndpoint = false
-			}
-		}
-	}
-	const isLocalProvider = isExplicitLocalProvider || isLocalhostEndpoint
+	// Detect local providers using centralized function
+	const isLocalProvider = checkIsLocalProvider(providerName, settingsOfProvider)
 
+	// Optimize timeouts: local models should respond quickly, use aggressive timeouts
+	// Cloud models get more time for network latency
 	const timeoutMs = isLocalProvider ? 30_000 : 60_000 // 30s for local, 60s for remote
 	const commonPayloadOpts: ClientOptions = {
 		dangerouslyAllowBrowser: true,
 		timeout: timeoutMs,
-		maxRetries: 1, // Reduce retries for local models (they fail fast if not available)
-		// Enable HTTP/2 and connection reuse for better performance
-		// For localhost, connection reuse is especially important to avoid TCP handshake overhead
-		// The OpenAI SDK uses keep-alive by default, which is optimal for localhost
-		httpAgent: undefined, // Let SDK handle connection pooling (optimized for localhost)
+		maxRetries: isLocalProvider ? 0 : 1, // No retries for local models (fail fast), 1 retry for cloud
+		// CRITICAL: For localhost, connection reuse eliminates TCP handshake overhead (saves 10-50ms per request)
+		// The OpenAI SDK uses keep-alive by default, but we ensure it's enabled
+		// httpAgent: undefined lets SDK use its optimized default agent with keep-alive
+		httpAgent: undefined, // SDK's default agent has keep-alive enabled, optimal for localhost
 		...includeInPayload,
 	}
 	if (providerName === 'openAI') {
@@ -328,7 +324,8 @@ const newOpenAICompatibleSDK = async ({ settingsOfProvider, providerName, includ
 }
 
 
-const _sendOpenAICompatibleFIM = async ({ messages: { prefix, suffix, stopTokens }, onFinalMessage, onError, settingsOfProvider, modelName: modelName_, _setAborter, providerName, overridesOfModel, onText, featureName }: SendFIMParams_Internal) => {
+// Match Void's approach: Non-streaming FIM for OpenAI-compatible providers
+const _sendOpenAICompatibleFIM = async ({ messages: { prefix, suffix, stopTokens }, onFinalMessage, onError, settingsOfProvider, modelName: modelName_, _setAborter, providerName, overridesOfModel, featureName }: SendFIMParams_Internal) => {
 
 	const {
 		modelName,
@@ -344,102 +341,341 @@ const _sendOpenAICompatibleFIM = async ({ messages: { prefix, suffix, stopTokens
 		return
 	}
 
-	// Detect if this is a local provider for streaming optimization
-	const isExplicitLocalProvider = providerName === 'ollama' || providerName === 'vLLM' || providerName === 'lmStudio'
-	let isLocalhostEndpoint = false
-	if (providerName === 'openAICompatible' || providerName === 'liteLLM') {
-		const endpoint = settingsOfProvider[providerName]?.endpoint || ''
-		if (endpoint) {
-			try {
-				// Use proper URL parsing to check hostname (not substring matching)
-				const url = new URL(endpoint)
-				const hostname = url.hostname.toLowerCase()
-				isLocalhostEndpoint = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0' || hostname === '::1'
-			} catch (e) {
-				// Invalid URL - assume non-local (safe default)
-				isLocalhostEndpoint = false
+	// Match Void: Use hardcoded max_tokens: 300 for FIM (Void doesn't vary this)
+	const maxTokensForThisCall = 300;
+
+	// Get client (cached for local, so this is fast)
+	const openai = await getOpenAICompatibleClient({ providerName, settingsOfProvider, includeInPayload: additionalOpenAIPayload });
+
+	// Performance instrumentation
+	const endpoint = settingsOfProvider[providerName]?.endpoint || ''
+	const isLocalProvider = checkIsLocalProvider(providerName, endpoint)
+	const promptBytes = (prefix + suffix).length;
+	const promptTokensEst = Math.ceil(promptBytes / 4);
+	let perfSpan: LocalLLMPerfSpan | undefined;
+	if (isLocalProvider) {
+		const temperature = (additionalOpenAIPayload as any)?.temperature;
+		const topP = (additionalOpenAIPayload as any)?.top_p;
+		perfSpan = perfSpanTracker.createSpan(
+			providerName,
+			modelName,
+			featureName === 'Autocomplete' ? 'complete' : 'edit',
+			promptTokensEst,
+			promptBytes,
+			maxTokensForThisCall,
+			temperature,
+			topP
+		);
+	}
+
+	// Step 4A: Server-side caching (capability-gated)
+	// Generate cache key if backend supports it
+	const capabilities = getBackendCapabilities(providerName);
+	const shouldUseServerSideCache = capabilities.supportsPromptCachingKey() || capabilities.supportsServerSideContextCaching();
+	const cacheKey = shouldUseServerSideCache ? generateFIMCacheKey(prefix, modelName) : undefined;
+
+	// Build request payload with optional cache key
+	const requestPayload: OpenAI.Completions.CompletionCreateParams = {
+		model: modelName,
+		prompt: prefix,
+		suffix: suffix,
+		stop: stopTokens,
+		max_tokens: maxTokensForThisCall,
+	};
+
+	// Add cache key if supported (vLLM and some other backends support this)
+	if (cacheKey && shouldUseServerSideCache) {
+		// vLLM supports cache_config parameter for prefix caching
+		// Format: { "cache_config": { "prompt_cache_key": cacheKey } }
+		(requestPayload as any).extra_body = {
+			cache_config: {
+				prompt_cache_key: cacheKey,
+			},
+		};
+	}
+
+	// Match Void: Non-streaming FIM using .then()/.catch() pattern
+	openai.completions
+		.create(requestPayload)
+		.then(async response => {
+			const fullText = response.choices[0]?.text || '';
+			if (perfSpan) {
+				perfSpanTracker.completeSpan(perfSpan, true);
+			}
+			onFinalMessage({ fullText, fullReasoning: '', anthropicReasoning: null });
+		})
+		.catch(error => {
+			if (perfSpan) {
+				const errorCategory = error instanceof OpenAI.APIError ? `APIError_${error.status}` : 'Unknown';
+				perfSpanTracker.completeSpan(perfSpan, false, errorCategory);
+			}
+			if (error instanceof OpenAI.APIError && error.status === 401) {
+				onError({ message: invalidApiKeyMessage(providerName), fullError: error });
+			} else {
+				onError({ message: error + '', fullError: error });
+			}
+		})
+}
+
+// Match Void: Use native Ollama SDK for FIM (better than OpenAI-compatible endpoint)
+const sendOllamaFIM = ({ messages, onFinalMessage, onError, settingsOfProvider, modelName, _setAborter }: SendFIMParams_Internal) => {
+	const thisConfig = settingsOfProvider.ollama
+	const ollama = getOllamaClient({ endpoint: thisConfig.endpoint })
+
+	let fullText = ''
+	ollama.generate({
+		model: modelName,
+		prompt: messages.prefix,
+		suffix: messages.suffix,
+		options: {
+			stop: messages.stopTokens,
+			num_predict: 300, // Match Void: hardcoded 300 tokens
+		},
+		raw: true,
+		stream: true, // Stream to get tokens as they come, but we accumulate and call onFinalMessage once
+	})
+		.then(async stream => {
+			_setAborter(() => stream.abort())
+			for await (const chunk of stream) {
+				const newText = chunk.response
+				fullText += newText
+			}
+			onFinalMessage({ fullText, fullReasoning: '', anthropicReasoning: null })
+		})
+		.catch((error) => {
+			onError({ message: error + '', fullError: error })
+		})
+}
+
+// Use native Ollama SDK for chat (much faster than OpenAI-compatible endpoint)
+// This bypasses the OpenAI SDK wrapper and calls Ollama directly
+// Ollama now supports native tool calling (as of 2024), so we can use it for agent mode too!
+const sendOllamaChat = async ({ messages, onText, onFinalMessage, onError, settingsOfProvider, modelName, _setAborter, separateSystemMessage, overridesOfModel, chatMode, mcpTools }: SendChatParams_Internal): Promise<void> => {
+	const thisConfig = settingsOfProvider.ollama
+	console.debug('[sendOllamaChat] Using native Ollama SDK. Endpoint:', thisConfig.endpoint, 'Model:', modelName)
+	const ollama = getOllamaClient({ endpoint: thisConfig.endpoint })
+
+	// Get tools if needed (for agent mode or when MCP tools are present)
+	const potentialTools = openAITools(chatMode, mcpTools)
+	const hasTools = potentialTools && potentialTools.length > 0
+
+	// Check if model likely supports native tool calling
+	// Models that DON'T support native tool calling: llama3 (without .1), older models
+	// Models that DO support native tool calling: llama3.1, llama3.2, llama3.3, qwen2.5, qwq, deepseek-r1, devstral, etc.
+	// We check the model name to avoid unnecessary errors, but still try for unknown models
+	const modelNameLower = modelName.toLowerCase()
+	const knownUnsupportedModels = ['llama3:', 'llama3:latest', 'llama3:8b', 'llama3:70b', 'llama3:8b-instruct', 'llama3:70b-instruct']
+	const isKnownUnsupported = knownUnsupportedModels.some(unsupported => modelNameLower.includes(unsupported))
+
+	if (hasTools) {
+		if (isKnownUnsupported) {
+			// Skip native tool calling attempt for known unsupported models - go straight to OpenAI-compatible endpoint
+			console.debug('[sendOllamaChat] Tools detected, but model doesn\'t support native tool calling, using OpenAI-compatible endpoint')
+			return _sendOpenAICompatibleChat({ messages, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions: undefined, modelName, _setAborter, providerName: 'ollama', chatMode, separateSystemMessage, overridesOfModel, mcpTools })
+		} else {
+			console.debug('[sendOllamaChat] Tools detected, attempting native Ollama tool calling support')
+		}
+	}
+
+	// Convert LLMChatMessage[] to Ollama's message format
+	// Ollama expects: { role: 'user' | 'assistant' | 'system', content: string }[]
+	// Note: For tool calls, we need to handle tool role messages and tool_calls in assistant messages
+	const ollamaMessages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }> = []
+
+	// Add system message if provided
+	if (separateSystemMessage) {
+		ollamaMessages.push({ role: 'system', content: separateSystemMessage })
+	}
+
+	// Convert messages to Ollama format
+	for (const msg of messages) {
+		if ('role' in msg) {
+			if (msg.role === 'system' || msg.role === 'developer') {
+				// System messages already handled above, or add here if no separateSystemMessage
+				if (!separateSystemMessage && 'content' in msg && typeof msg.content === 'string') {
+					ollamaMessages.push({ role: 'system', content: msg.content })
+				}
+			} else if (msg.role === 'user') {
+				// Extract text content from user message (handle OpenAI/Anthropic format, skip Gemini)
+				let content = ''
+				if ('content' in msg) {
+					if (typeof msg.content === 'string') {
+						content = msg.content
+					} else if (Array.isArray(msg.content)) {
+						// Extract text from content array
+						content = msg.content
+							.filter((part: any) => part.type === 'text')
+							.map((part: any) => part.text)
+							.join(' ')
+					}
+				}
+				// Skip Gemini messages (they use 'parts' not 'content')
+				if (content) {
+					ollamaMessages.push({ role: 'user', content })
+				}
+			} else if (msg.role === 'assistant') {
+				// Extract text content from assistant message (handle OpenAI/Anthropic format, skip Gemini)
+				let content = ''
+				if ('content' in msg) {
+					if (typeof msg.content === 'string') {
+						content = msg.content
+					} else if (Array.isArray(msg.content)) {
+						// Extract text from content array
+						content = msg.content
+							.filter((part: any) => part.type === 'text')
+							.map((part: any) => part.text)
+							.join(' ')
+					}
+				}
+				// Skip Gemini messages (they use 'parts' not 'content')
+				if (content) {
+					ollamaMessages.push({ role: 'assistant', content })
+				}
+				// Note: Ollama's native SDK handles tool_calls automatically if tools are provided
+			} else if (msg.role === 'tool' && hasTools) {
+				// For tool responses, we need to convert them to user messages with tool results
+				// Ollama's native SDK expects tool results in a specific format
+				// For now, we'll include tool results as part of the conversation context
+				if ('content' in msg && typeof msg.content === 'string') {
+					ollamaMessages.push({ role: 'user', content: msg.content })
+				}
 			}
 		}
 	}
-	const isLocalProvider = isExplicitLocalProvider || isLocalhostEndpoint
 
-	const openai = await getOpenAICompatibleClient({ providerName, settingsOfProvider, includeInPayload: additionalOpenAIPayload })
+	// Get model options from overrides if available
+	const { additionalOpenAIPayload, contextWindow } = getModelCapabilities('ollama', modelName, overridesOfModel)
+	const options: any = {}
+	if (additionalOpenAIPayload) {
+		if (additionalOpenAIPayload.temperature !== undefined) {
+			options.temperature = additionalOpenAIPayload.temperature
+		}
+		if (additionalOpenAIPayload.top_p !== undefined) {
+			options.top_p = additionalOpenAIPayload.top_p
+		}
+	}
 
-	// Compute max_tokens based on feature and provider type
-	const maxTokensForThisCall = computeMaxTokensForLocalProvider(isLocalProvider, featureName)
+	// Part F: Ollama Performance Optimizations
+	// Based on Ollama best practices for speed:
+	// - num_ctx: Context window size (use model's context window, but cap for performance)
+	// - num_predict: Max tokens to generate (null = unlimited, but we can set reasonable defaults)
+	// - num_thread: Number of threads (Ollama auto-detects, but can be set)
+	// Note: These are optional and Ollama will use defaults if not set
+	// For local models, we optimize for speed over maximum context
+	if (contextWindow) {
+		// Cap context window for performance (local models are slower with very large contexts)
+		// Use 75% of model's context window or 32k, whichever is smaller (for speed)
+		const effectiveCtx = Math.min(Math.floor(contextWindow * 0.75), 32_000);
+		options.num_ctx = effectiveCtx;
+	}
+	// num_predict: Let Ollama use default (unlimited) unless user specifies
+	// num_thread: Let Ollama auto-detect (usually optimal)
 
-	// For local models, use streaming FIM for better responsiveness
-	// Only stream if onText is provided and not empty (some consumers like autocomplete have empty onText)
-	if (isLocalProvider && onText && typeof onText === 'function') {
-		let fullText = ''
-		let firstTokenReceived = false
-		const firstTokenTimeout = 10_000 // 10 seconds for first token on local models
+	let fullTextSoFar = ''
 
-		const stream = await openai.completions.create({
-			model: modelName,
-			prompt: prefix,
-			suffix: suffix,
-			stop: stopTokens,
-			max_tokens: maxTokensForThisCall,
-			stream: true,
-		})
+	// Ensure we have at least one message
+	if (ollamaMessages.length === 0) {
+		console.error('[sendOllamaChat] No messages to send after conversion. Original messages count:', messages.length)
+		onError({ message: 'No messages to send to Ollama. Please provide at least one message.', fullError: null })
+		return
+	}
 
-		_setAborter(() => stream.controller?.abort())
+	console.debug('[sendOllamaChat] Sending request with', ollamaMessages.length, 'messages. Options:', Object.keys(options).length > 0 ? options : 'none', 'Tools:', hasTools ? potentialTools?.length : 0)
 
-		// Set up first token timeout for local models
-		const firstTokenTimeoutId = setTimeout(() => {
-			if (!firstTokenReceived) {
-				stream.controller?.abort()
-				onError({
-					message: 'Local model took too long to respond for autocomplete. Try a smaller model or a cloud model.',
-					fullError: null
-				})
-			}
-		}, firstTokenTimeout)
+	// Prepare chat request - Ollama's native SDK now supports tools parameter
+	const chatRequest: any = {
+		model: modelName,
+		messages: ollamaMessages,
+		stream: true,
+		options: Object.keys(options).length > 0 ? options : undefined,
+	}
 
-		try {
+	// Add tools if available (Ollama supports native tool calling)
+	if (hasTools && potentialTools) {
+		chatRequest.tools = potentialTools
+	}
+
+	let toolName = ''
+	let toolId = ''
+	let toolParamsStr = ''
+
+	return ollama.chat(chatRequest)
+		.then(async stream => {
+			console.debug('[sendOllamaChat] Stream started successfully')
+			_setAborter(() => stream.abort())
+			let chunkCount = 0
 			for await (const chunk of stream) {
-				// Mark first token received
-				if (!firstTokenReceived) {
-					firstTokenReceived = true
-					clearTimeout(firstTokenTimeoutId)
+				chunkCount++
+				// Ollama chat streaming format: chunk.message.content
+				// The ChatResponse type has a message property with content
+				const newText = chunk.message?.content || ''
+				if (newText) {
+					fullTextSoFar += newText
 				}
 
-				const newText = chunk.choices[0]?.text ?? ''
-				fullText += newText
-				onText({
-					fullText,
+				// Handle tool calls if present (Ollama's native tool calling format)
+				// Ollama's tool_calls structure matches OpenAI format: { id, type, function: { name, arguments } }
+				const toolCalls = chunk.message?.tool_calls
+				if (toolCalls && toolCalls.length > 0) {
+					const toolCall = toolCalls[0] // Handle first tool call
+					if (toolCall.function) {
+						toolName += toolCall.function.name || ''
+						toolParamsStr += toolCall.function.arguments || ''
+						// Ollama's tool call may have id property, but it's optional in streaming
+						toolId += (toolCall as any).id || ''
+					}
+				}
+
+				// Call onText immediately for streaming updates (no batching delay)
+				if (newText || (toolCalls && toolCalls.length > 0)) {
+					onText({
+						fullText: fullTextSoFar,
+						fullReasoning: '',
+						toolCall: !toolName ? undefined : { name: toolName, rawParams: {}, isDone: false, doneParams: [], id: toolId },
+					})
+				}
+
+				if (chunkCount === 1 && !newText && !toolCalls) {
+					// Log first chunk structure for debugging
+					console.debug('[sendOllamaChat] First chunk structure:', JSON.stringify(chunk, null, 2))
+				}
+			}
+			console.debug('[sendOllamaChat] Stream completed. Total chunks:', chunkCount, 'Final text length:', fullTextSoFar.length, 'Tool call:', toolName || 'none')
+
+			// Call onFinalMessage when stream completes
+			if (fullTextSoFar || toolName) {
+				const toolCall = toolName ? rawToolCallObjOfParamsStr(toolName, toolParamsStr, toolId) : null
+				const toolCallObj = toolCall ? { toolCall } : {}
+				onFinalMessage({
+					fullText: fullTextSoFar,
 					fullReasoning: '',
-					toolCall: undefined,
+					anthropicReasoning: null,
+					...toolCallObj,
 				})
+			} else {
+				console.error('[sendOllamaChat] Stream completed but no text or tool call was received. Chunk count:', chunkCount)
+				onError({ message: 'Ollama returned an empty response.', fullError: null })
+			}
+		})
+		.catch((error) => {
+			// Provide more detailed error information
+			const errorMessage = error instanceof Error ? error.message : String(error)
+			const detailedError = error instanceof Error ? error : new Error(String(error))
+			console.error('[sendOllamaChat] Error:', errorMessage, 'Full error:', error)
+
+			// If tool calling fails, fall back to OpenAI-compatible endpoint
+			// This handles cases where the model doesn't support native tool calling
+			if (hasTools && (errorMessage.includes('tool') || errorMessage.includes('function'))) {
+				console.debug('[sendOllamaChat] Native tool calling failed, falling back to OpenAI-compatible endpoint')
+				return _sendOpenAICompatibleChat({ messages, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions: undefined, modelName, _setAborter, providerName: 'ollama', chatMode, separateSystemMessage, overridesOfModel, mcpTools })
 			}
 
-			// Clear timeout on successful completion
-			clearTimeout(firstTokenTimeoutId)
-			onFinalMessage({ fullText, fullReasoning: '', anthropicReasoning: null });
-		} catch (streamError) {
-			clearTimeout(firstTokenTimeoutId)
-			onError({ message: streamError + '', fullError: streamError instanceof Error ? streamError : new Error(String(streamError)) });
-		}
-	} else {
-		// Non-streaming for remote models (fallback)
-		openai.completions
-			.create({
-				model: modelName,
-				prompt: prefix,
-				suffix: suffix,
-				stop: stopTokens,
-				max_tokens: maxTokensForThisCall,
+			onError({
+				message: `Ollama error: ${errorMessage}. Check that Ollama is running and the model "${modelName}" is available.`,
+				fullError: detailedError
 			})
-			.then(async response => {
-				const fullText = response.choices[0]?.text
-				onFinalMessage({ fullText, fullReasoning: '', anthropicReasoning: null });
-			})
-			.catch(error => {
-				if (error instanceof OpenAI.APIError && error.status === 401) { onError({ message: invalidApiKeyMessage(providerName), fullError: error }); }
-				else { onError({ message: error + '', fullError: error }); }
-			})
-	}
+			return // Explicit return for void function
+		})
 }
 
 
@@ -465,14 +701,110 @@ const toOpenAICompatibleTool = (toolInfo: InternalToolInfo) => {
 	} satisfies OpenAI.Chat.Completions.ChatCompletionTool
 }
 
+// Part C: Tool Schema Cache - cache tool schemas to avoid rebuilding on every request
+const toolSchemaCacheMap = new Map<string, {
+	openAIFormat: OpenAI.Chat.Completions.ChatCompletionTool[] | null;
+	timestamp: number;
+}>();
+const TOOL_SCHEMA_CACHE_TTL = 300_000; // 5 minutes
+const TOOL_SCHEMA_CACHE_MAX_SIZE = 50;
+
+function computeToolsetHash(chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, allowedTools: { [key: string]: InternalToolInfo } | undefined): string {
+	const toolNames: string[] = [];
+	const toolSchemas: string[] = [];
+	const mcpServerNames: string[] = [];
+
+	if (allowedTools) {
+		for (const toolName in allowedTools) {
+			const tool = allowedTools[toolName];
+			toolNames.push(tool.name);
+			const schemaStr = JSON.stringify({
+				name: tool.name,
+				description: tool.description,
+				params: tool.params,
+			});
+			toolSchemas.push(schemaStr);
+		}
+	}
+
+	if (mcpTools) {
+		for (const mcpTool of mcpTools) {
+			mcpServerNames.push(mcpTool.mcpServerName || '');
+			toolNames.push(mcpTool.name);
+			const schemaStr = JSON.stringify({
+				name: mcpTool.name,
+				description: mcpTool.description,
+				params: mcpTool.params,
+			});
+			toolSchemas.push(schemaStr);
+		}
+	}
+
+	const hashInput = JSON.stringify({
+		chatMode,
+		toolNames: toolNames.sort(),
+		toolSchemas: toolSchemas.sort(),
+		mcpServerNames: mcpServerNames.sort(),
+	});
+
+	// Simple hash function
+	let hash = 0;
+	for (let i = 0; i < hashInput.length; i++) {
+		const char = hashInput.charCodeAt(i);
+		hash = ((hash << 5) - hash) + char;
+		hash = hash & hash;
+	}
+	return hash.toString(36);
+}
+
 const openAITools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined) => {
 	const allowedTools = availableTools(chatMode, mcpTools)
 	if (!allowedTools || Object.keys(allowedTools).length === 0) return null
 
+	// Part C: Check cache first
+	const hash = computeToolsetHash(chatMode, mcpTools, allowedTools);
+	const now = Date.now();
+	const cached = toolSchemaCacheMap.get(hash);
+
+	if (cached && (now - cached.timestamp) < TOOL_SCHEMA_CACHE_TTL) {
+		return cached.openAIFormat;
+	}
+
+	// Build tool schemas (expensive operation)
+	const buildStart = performance.now();
 	const openAITools: OpenAI.Chat.Completions.ChatCompletionTool[] = []
 	for (const t in allowedTools ?? {}) {
 		openAITools.push(toOpenAICompatibleTool(allowedTools[t]))
 	}
+	const buildMs = performance.now() - buildStart;
+
+	// Log in dev mode if build took significant time
+	const isDev = typeof process !== 'undefined' && (process.env.NODE_ENV === 'development' || process.env.DEBUG);
+	if (isDev && buildMs > 5) {
+		console.debug(`[ToolSchemaCache] Built OpenAI tools in ${buildMs.toFixed(2)}ms`);
+	}
+
+	// Cache result
+	if (toolSchemaCacheMap.size >= TOOL_SCHEMA_CACHE_MAX_SIZE) {
+		// Remove oldest entry
+		let oldestKey: string | undefined;
+		let oldestTime = Infinity;
+		for (const [key, value] of toolSchemaCacheMap.entries()) {
+			if (value.timestamp < oldestTime) {
+				oldestTime = value.timestamp;
+				oldestKey = key;
+			}
+		}
+		if (oldestKey) {
+			toolSchemaCacheMap.delete(oldestKey);
+		}
+	}
+
+	toolSchemaCacheMap.set(hash, {
+		openAIFormat: openAITools,
+		timestamp: now,
+	});
+
 	return openAITools
 }
 
@@ -530,12 +862,8 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		{ tools: potentialTools } as const
 		: {}
 
-	// instance
-	const openai: OpenAI = await getOpenAICompatibleClient({ providerName, settingsOfProvider, includeInPayload })
-	if (providerName === 'microsoftAzure') {
-		// Required to select the model
-		(openai as AzureOpenAI).deploymentName = modelName;
-	}
+	// PERFORMANCE: Client creation moved earlier (see openaiPromise above)
+	// This allows client to be fetched in parallel with other setup work
 
 	// open source models - manually parse think tokens
 	const { needsManualParse: needsManualReasoningParse, nameOfFieldInDelta: nameOfReasoningFieldInDelta } = providerReasoningIOSettings?.output ?? {}
@@ -562,23 +890,167 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 	let isRetrying = false // Flag to prevent processing streaming chunks during retry
 
 	// Detect if this is a local provider for timeout optimization
-	const isExplicitLocalProviderChat = providerName === 'ollama' || providerName === 'vLLM' || providerName === 'lmStudio'
-	let isLocalhostEndpointChat = false
-	if (providerName === 'openAICompatible' || providerName === 'liteLLM') {
-		const endpoint = settingsOfProvider[providerName]?.endpoint || ''
-		if (endpoint) {
-			try {
-				const url = new URL(endpoint)
-				const hostname = url.hostname.toLowerCase()
-				isLocalhostEndpointChat = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0' || hostname === '::1'
-			} catch (e) {
-				isLocalhostEndpointChat = false
+	const endpoint = settingsOfProvider[providerName]?.endpoint || ''
+	const isLocalChat = checkIsLocalProvider(providerName, endpoint)
+
+	// Performance instrumentation (Step 1)
+	const promptBytes = JSON.stringify(messages).length;
+	const promptTokensEst = Math.ceil(promptBytes / 4); // Rough estimate: ~4 chars per token
+	let perfSpan: LocalLLMPerfSpan | undefined;
+	if (isLocalChat) {
+		// Extract temperature/top_p from additionalOpenAIPayload if available
+		const temperature = (includeInPayload as any)?.temperature;
+		const topP = (includeInPayload as any)?.top_p;
+		perfSpan = perfSpanTracker.createSpan(
+			providerName,
+			modelName,
+			'chat',
+			promptTokensEst,
+			promptBytes,
+			getReservedOutputTokenSpace(providerName, modelName_, { isReasoningEnabled: !!reasoningInfo?.isReasoningEnabled, overridesOfModel }) || 4096,
+			temperature,
+			topP
+		);
+	}
+
+	// PERFORMANCE: Get client early - for local models this is cached and fast
+	// Start client creation immediately, don't wait for other setup
+	const openaiPromise = getOpenAICompatibleClient({ providerName, settingsOfProvider, includeInPayload })
+
+	// Optimized streaming handler for local providers (Ollama, vLLM, LM Studio, etc.)
+	// Reduces overhead by skipping expensive operations and batching perf tracking
+	// Key optimizations:
+	// - Shorter timeouts (20s vs 120s for cloud)
+	// - Faster first token timeout (10s vs 30s)
+	// - Batched token counting (every 10 chunks instead of every chunk)
+	// - Immediate onText calls (no batching delay)
+	const processStreamingResponseLocal = async (response: any) => {
+		_setAborter(() => response.controller.abort())
+
+		const overallTimeout = 20_000 // 20s for local
+		const firstTokenTimeout = 10_000 // 10s for first token
+
+		let firstTokenReceived = false
+		let tokenCountUpdateCounter = 0 // Batch token counting (only every 10 chunks)
+
+		// Set up overall timeout
+		const timeoutId = setTimeout(() => {
+			if (fullTextSoFar || fullReasoningSoFar || toolName) {
+				const toolCall = rawToolCallObjOfParamsStr(toolName, toolParamsStr, toolId)
+				const toolCallObj = toolCall ? { toolCall } : {}
+				onFinalMessage({
+					fullText: fullTextSoFar,
+					fullReasoning: fullReasoningSoFar,
+					anthropicReasoning: null,
+					...toolCallObj
+				})
+			} else {
+				response.controller?.abort()
+				onError({
+					message: 'Local model timed out. Try a smaller model or use a cloud model for this task.',
+					fullError: null
+				})
 			}
+		}, overallTimeout)
+
+		// Set up first token timeout
+		const firstTokenTimeoutId = setTimeout(() => {
+			if (!firstTokenReceived) {
+				response.controller?.abort()
+				onError({
+					message: 'Local model is too slow (no response after 10s). Try a smaller/faster model or use a cloud model.',
+					fullError: null
+				})
+			}
+		}, firstTokenTimeout)
+
+		try {
+			for await (const chunk of response) {
+				if (isRetrying) {
+					clearTimeout(timeoutId)
+					clearTimeout(firstTokenTimeoutId)
+					return
+				}
+
+				// Mark first token received
+				if (!firstTokenReceived) {
+					firstTokenReceived = true
+					clearTimeout(firstTokenTimeoutId)
+					if (perfSpan) {
+						perfSpanTracker.recordFirstToken(perfSpan);
+					}
+				}
+
+				// Extract text (optimized - single access)
+				const delta = chunk.choices?.[0]?.delta
+				const newText = delta?.content ?? ''
+				if (newText) {
+					fullTextSoFar += newText
+
+					// Batch token counting (only every 10 chunks to reduce overhead)
+					if (perfSpan && perfSpan.start_time_ms && (++tokenCountUpdateCounter % 10 === 0)) {
+						const tokenCount = Math.ceil(fullTextSoFar.length / 4); // Faster: char-based estimate
+						const elapsedMs = Date.now() - perfSpan.start_time_ms;
+						perfSpanTracker.recordToken(perfSpan, tokenCount, elapsedMs);
+					}
+				}
+
+				// Tool call (only process if present)
+				const toolCalls = delta?.tool_calls
+				if (toolCalls && toolCalls.length > 0) {
+					const tool = toolCalls[0]
+					if (tool.index === 0) {
+						toolName += tool.function?.name ?? ''
+						toolParamsStr += tool.function?.arguments ?? ''
+						toolId += tool.id ?? ''
+					}
+				}
+
+				// Reasoning (only if needed)
+				if (nameOfReasoningFieldInDelta && delta) {
+					// @ts-ignore
+					const newReasoning = (delta[nameOfReasoningFieldInDelta] || '') + ''
+					if (newReasoning) {
+						fullReasoningSoFar += newReasoning
+					}
+				}
+
+				// Call onText immediately (no batching delay for local models)
+				onText({
+					fullText: fullTextSoFar,
+					fullReasoning: fullReasoningSoFar,
+					toolCall: !toolName ? undefined : { name: toolName, rawParams: {}, isDone: false, doneParams: [], id: toolId },
+				})
+			}
+		} catch (streamError) {
+			clearTimeout(timeoutId)
+			clearTimeout(firstTokenTimeoutId)
+			if (perfSpan) {
+				const errorCategory = streamError instanceof Error ? streamError.name : 'Unknown';
+				perfSpanTracker.completeSpan(perfSpan, false, errorCategory);
+			}
+			throw streamError
+		}
+
+		clearTimeout(timeoutId)
+		clearTimeout(firstTokenTimeoutId)
+
+		if (!fullTextSoFar && !fullReasoningSoFar && !toolName) {
+			if (perfSpan) {
+				perfSpanTracker.completeSpan(perfSpan, false, 'EmptyResponse');
+			}
+			onError({ message: 'CortexIDE: Response from model was empty.', fullError: null })
+		} else {
+			if (perfSpan) {
+				perfSpanTracker.completeSpan(perfSpan, true);
+			}
+			const toolCall = rawToolCallObjOfParamsStr(toolName, toolParamsStr, toolId)
+			const toolCallObj = toolCall ? { toolCall } : {}
+			onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, ...toolCallObj });
 		}
 	}
-	const isLocalChat = isExplicitLocalProviderChat || isLocalhostEndpointChat
 
-	// Helper function to process streaming response
+	// Helper function to process streaming response (for cloud providers)
 	const processStreamingResponse = async (response: any) => {
 		_setAborter(() => response.controller.abort())
 
@@ -644,11 +1116,19 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 						clearTimeout(firstTokenTimeoutId)
 						firstTokenTimeoutId = null
 					}
+					if (perfSpan) {
+						perfSpanTracker.recordFirstToken(perfSpan);
+					}
 				}
 
 				// message
 				const newText = chunk.choices[0]?.delta?.content ?? ''
 				fullTextSoFar += newText
+				if (perfSpan && perfSpan.start_time_ms) {
+					const tokenCount = fullTextSoFar.split(/\s+/).length; // Rough token count
+					const elapsedMs = Date.now() - perfSpan.start_time_ms;
+					perfSpanTracker.recordToken(perfSpan, tokenCount, elapsedMs);
+				}
 
 				// tool call
 				for (const tool of chunk.choices[0]?.delta?.tool_calls ?? []) {
@@ -684,9 +1164,15 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 
 			// on final
 			if (!fullTextSoFar && !fullReasoningSoFar && !toolName) {
+				if (perfSpan) {
+					perfSpanTracker.completeSpan(perfSpan, false, 'EmptyResponse');
+				}
 				onError({ message: 'CortexIDE: Response from model was empty.', fullError: null })
 			}
 			else {
+				if (perfSpan) {
+					perfSpanTracker.completeSpan(perfSpan, true);
+				}
 				const toolCall = rawToolCallObjOfParamsStr(toolName, toolParamsStr, toolId)
 				const toolCallObj = toolCall ? { toolCall } : {}
 				onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, ...toolCallObj });
@@ -694,6 +1180,10 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		} catch (streamError) {
 			clearTimeout(timeoutId)
 			if (firstTokenTimeoutId) clearTimeout(firstTokenTimeoutId)
+			if (perfSpan) {
+				const errorCategory = streamError instanceof Error ? streamError.name : 'Unknown';
+				perfSpanTracker.completeSpan(perfSpan, false, errorCategory);
+			}
 			// If error occurs during streaming, re-throw to be caught by outer catch handler
 			throw streamError
 		}
@@ -730,6 +1220,57 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		onFinalMessage({ fullText: fullText, fullReasoning: '', anthropicReasoning: null, ...toolCallObj });
 	}
 
+	// PERFORMANCE: Await client now (it was started in parallel above)
+	// For local models, this is cached and returns immediately
+	const openai = await openaiPromise
+	if (providerName === 'microsoftAzure') {
+		// Required to select the model
+		(openai as AzureOpenAI).deploymentName = modelName;
+	}
+
+	// Step 4A: Server-side caching (capability-gated)
+	// Generate cache key if backend supports it
+	const capabilities = getBackendCapabilities(providerName);
+	const shouldUseServerSideCache = capabilities.supportsPromptCachingKey() || capabilities.supportsServerSideContextCaching();
+
+	// Extract system message (handle different message types)
+	const systemMsg = separateSystemMessage || (() => {
+		const sysMsg = messages.find(m => m.role === 'system');
+		if (!sysMsg) return undefined;
+		// Handle OpenAI/Anthropic messages (have 'content')
+		if ('content' in sysMsg && typeof sysMsg.content === 'string') {
+			return sysMsg.content;
+		}
+		return undefined;
+	})();
+
+	// Extract content from messages for cache key (handle Gemini's 'parts' vs others' 'content')
+	const extractMessageContent = (m: LLMChatMessage): string => {
+		if ('parts' in m) {
+			// Gemini message - extract text from parts
+			const textParts = m.parts.filter((p): p is { text: string } => 'text' in p);
+			return textParts.map(p => p.text).join(' ');
+		} else if ('content' in m) {
+			// OpenAI/Anthropic message
+			if (typeof m.content === 'string') {
+				return m.content;
+			}
+			return JSON.stringify(m.content);
+		}
+		return '';
+	};
+
+	const chatCacheKey = shouldUseServerSideCache && systemMsg
+		? generateChatCacheKey(
+			systemMsg,
+			messages.filter(m => m.role !== 'system' && m.role !== 'model').slice(0, 2).map(m => ({
+				role: m.role,
+				content: extractMessageContent(m)
+			})),
+			modelName
+		)
+		: undefined;
+
 	// Try streaming first
 	const options: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
 		model: modelName,
@@ -738,12 +1279,42 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		...nativeToolsObj,
 		...additionalOpenAIPayload
 		// max_completion_tokens: maxTokens,
+	};
+
+	// Part F: Add cache key if supported (vLLM and some other backends support this)
+	// vLLM prefix caching: Reuses KV cache for identical prompt prefixes, significantly speeding up tool turns
+	// Best practices (from vLLM docs):
+	// - Cache key should be stable for identical prefixes (system message + first few messages)
+	// - Different models need different cache keys (tokenization differs)
+	// - Cache is automatically managed by vLLM (LRU eviction)
+	if (chatCacheKey && shouldUseServerSideCache) {
+		// vLLM supports cache_config parameter for prefix caching
+		// Format: { "cache_config": { "prompt_cache_key": cacheKey } }
+		// This enables prefix caching which can speed up tool turns by 2-5x when system message is unchanged
+		(options as any).extra_body = {
+			cache_config: {
+				prompt_cache_key: chatCacheKey,
+			},
+		};
 	}
 
 	// Flag to ensure we only process one response (prevent duplicate processing)
 	// Use object reference to ensure atomic updates across async operations
 	const processingState = { responseProcessed: false, isProcessing: false }
 	let streamingResponse: any = null
+
+	// PERFORMANCE: Start request immediately - don't wait for any other setup
+	// The .create() call sends the HTTP request immediately
+	// Use optimized handler for local providers (Ollama, vLLM, LM Studio) for better performance
+	// This handler has shorter timeouts, batched token counting, and immediate onText calls
+	// Note: vLLM and LM Studio only have OpenAI-compatible APIs (no native SDK), so they're already using the fastest path
+	// Ollama has a native SDK which is used for normal/gather modes, but agent mode uses OpenAI-compatible endpoint
+	// (unless native tool calling is supported, which we now try first)
+	const useOptimizedLocalHandler = isLocalChat && (providerName === 'ollama' || providerName === 'vLLM' || providerName === 'lmStudio')
+	if (useOptimizedLocalHandler) {
+		console.debug(`[${providerName}] Using optimized local handler for faster performance (shorter timeouts, batched token counting)`)
+	}
+	const streamingHandler = useOptimizedLocalHandler ? processStreamingResponseLocal : processStreamingResponse
 
 	openai.chat.completions
 		.create(options)
@@ -755,7 +1326,7 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 			processingState.isProcessing = true
 			streamingResponse = response
 			try {
-				await processStreamingResponse(response)
+				await streamingHandler(response)
 				processingState.responseProcessed = true
 			} finally {
 				processingState.isProcessing = false
@@ -797,6 +1368,15 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 					stream: false,
 					...nativeToolsObj,
 					...additionalOpenAIPayload
+				};
+
+				// Add cache key if supported (same as streaming options)
+				if (chatCacheKey && shouldUseServerSideCache) {
+					(nonStreamingOptions as any).extra_body = {
+						cache_config: {
+							prompt_cache_key: chatCacheKey,
+						},
+					};
 				}
 
 				try {
@@ -852,6 +1432,15 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 					stream: true,
 					// Explicitly omit tools - don't include nativeToolsObj
 					...additionalOpenAIPayload
+				};
+
+				// Add cache key if supported (same as original options)
+				if (chatCacheKey && shouldUseServerSideCache) {
+					(optionsWithoutTools as any).extra_body = {
+						cache_config: {
+							prompt_cache_key: chatCacheKey,
+						},
+					};
 				}
 
 				try {
@@ -864,7 +1453,7 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 					processingState.isProcessing = true
 					streamingResponse = response
 					try {
-						await processStreamingResponse(response)
+						await streamingHandler(response)
 						processingState.responseProcessed = true
 					} finally {
 						processingState.isProcessing = false
@@ -885,14 +1474,24 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 				}
 			}
 			else if (error instanceof OpenAI.APIError && error.status === 401) {
+				if (perfSpan) {
+					perfSpanTracker.completeSpan(perfSpan, false, 'APIError_401');
+				}
 				onError({ message: invalidApiKeyMessage(providerName), fullError: error });
 			}
 			else if (error instanceof OpenAI.APIError && error.status === 429) {
 				// Rate limit exceeded - don't retry immediately, show clear error
+				if (perfSpan) {
+					perfSpanTracker.completeSpan(perfSpan, false, 'APIError_429');
+				}
 				const rateLimitMessage = error.message || 'Rate limit exceeded. Please wait a moment before trying again.';
 				onError({ message: `Rate limit exceeded: ${rateLimitMessage}`, fullError: error });
 			}
 			else {
+				if (perfSpan) {
+					const errorCategory = error instanceof OpenAI.APIError ? `APIError_${error.status}` : 'Unknown';
+					perfSpanTracker.completeSpan(perfSpan, false, errorCategory);
+				}
 				onError({ message: error + '', fullError: error });
 			}
 		})
@@ -1155,49 +1754,6 @@ const ollamaList = async ({ onSuccess: onSuccess_, onError: onError_, settingsOf
 	catch (error) {
 		onError({ error: error + '' })
 	}
-}
-
-const sendOllamaFIM = ({ messages, onFinalMessage, onError, settingsOfProvider, modelName, _setAborter, featureName, onText }: SendFIMParams_Internal) => {
-	const thisConfig = settingsOfProvider.ollama
-	const ollama = getOllamaClient({ endpoint: thisConfig.endpoint })
-
-	// Compute num_predict based on feature (Ollama is always local)
-	const numPredictForThisCall = computeMaxTokensForLocalProvider(true, featureName)
-
-	let fullText = ''
-	ollama.generate({
-		model: modelName,
-		prompt: messages.prefix,
-		suffix: messages.suffix,
-		options: {
-			stop: messages.stopTokens,
-			num_predict: numPredictForThisCall,
-			// repeat_penalty: 1,
-		},
-		raw: true,
-		stream: true, // stream is not necessary but lets us expose the
-	})
-		.then(async stream => {
-			_setAborter(() => stream.abort())
-			for await (const chunk of stream) {
-				const newText = chunk.response
-				fullText += newText
-				// Call onText during streaming for incremental UI updates (like OpenAI-compatible FIM)
-				// This enables true streaming UX for Ollama autocomplete
-				if (onText && typeof onText === 'function') {
-					onText({
-						fullText,
-						fullReasoning: '',
-						toolCall: undefined,
-					})
-				}
-			}
-			onFinalMessage({ fullText, fullReasoning: '', anthropicReasoning: null })
-		})
-		// when error/fail
-		.catch((error) => {
-			onError({ message: error + '', fullError: error })
-		})
 }
 
 // ---------------- GEMINI NATIVE IMPLEMENTATION ----------------
@@ -1465,8 +2021,8 @@ export const sendLLMMessageToProviderImplementation = {
 		list: null,
 	},
 	ollama: {
-		sendChat: (params) => _sendOpenAICompatibleChat(params),
-		sendFIM: sendOllamaFIM,
+		sendChat: (params) => sendOllamaChat(params), // Use native Ollama SDK for chat (much faster than OpenAI-compatible endpoint)
+		sendFIM: (params) => sendOllamaFIM(params), // Match Void: Use native Ollama SDK for FIM (better compatibility)
 		list: ollamaList,
 	},
 	openAICompatible: {

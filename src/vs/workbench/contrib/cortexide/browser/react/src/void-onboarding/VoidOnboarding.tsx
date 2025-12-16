@@ -9,6 +9,7 @@ import { Brain, Check, ChevronRight, DollarSign, ExternalLink, Lock, X } from 'l
 import { displayInfoOfProviderName, ProviderName, providerNames, localProviderNames, featureNames, FeatureName, isFeatureNameDisabled } from '../../../../common/cortexideSettingsTypes.js';
 import { ChatMarkdownRender } from '../markdown/ChatMarkdownRender.js';
 import { OllamaSetupInstructions, OneClickSwitchButton, SettingsForProvider, ModelDump } from '../void-settings-tsx/Settings.js';
+import { LocalSetupWizard } from './LocalSetupWizard.js';
 import { ColorScheme } from '../../../../../../../platform/theme/common/theme.js';
 import ErrorBoundary from '../sidebar-tsx/ErrorBoundary.js';
 import { FileAccess } from '../../../../../../../base/common/network.js';
@@ -577,8 +578,11 @@ const VoidOnboardingContent = () => {
 	const voidMetricsService = accessor.get('IMetricsService')
 
 	const voidSettingsState = useSettingsState()
+	const accessor = useAccessor()
+	const localSetupService = accessor.get('ILocalSetupService')
 
 	const [pageIndex, setPageIndex] = useState(0)
+	const [showLocalWizard, setShowLocalWizard] = useState(false)
 
 
 	// page 1 state
@@ -700,8 +704,30 @@ const VoidOnboardingContent = () => {
 	}, [setPageIndex, voidSettingsState.globalSettings.isOnboardingComplete])
 
 
+	// Check if we should show local wizard on first run
+	useEffect(() => {
+		if (!isOnboardingComplete && pageIndex === 0) {
+			// Check if user has local models configured
+			const hasLocalModels = voidSettingsState.settingsOfProvider.ollama.models.length > 0 ||
+				voidSettingsState.settingsOfProvider.vLLM.models.length > 0 ||
+				voidSettingsState.settingsOfProvider.lmStudio.models.length > 0;
+
+			// Show wizard if no local models and wizard hasn't been completed
+			const wizardCompleted = localSetupService.state.type === 'done';
+			if (!hasLocalModels && !wizardCompleted) {
+				// Don't auto-show, let user choose in WelcomePage
+			}
+		}
+	}, [isOnboardingComplete, pageIndex, voidSettingsState, localSetupService]);
+
 	const contentOfIdx: { [pageIndex: number]: React.ReactNode } = {
-		0: <WelcomePage onNext={() => setPageIndex(1)} onSkip={() => skipOnboarding('welcome-skip')} />,
+		0: <WelcomePage
+			onNext={() => {
+				// Show local wizard choice step
+				setShowLocalWizard(true);
+			}}
+			onSkip={() => skipOnboarding('welcome-skip')}
+		/>,
 
 		1: <OnboardingPageShell hasMaxWidth={false}
 			content={
@@ -726,6 +752,21 @@ const VoidOnboardingContent = () => {
 		/>,
 	}
 
+
+	if (showLocalWizard) {
+		return (
+			<LocalSetupWizard
+				onComplete={() => {
+					setShowLocalWizard(false);
+					setPageIndex(1); // Continue to Add Providers page
+				}}
+				onSkip={() => {
+					setShowLocalWizard(false);
+					setPageIndex(1); // Continue to Add Providers page
+				}}
+			/>
+		);
+	}
 
 	return <div key={pageIndex} className="w-full h-[80vh] text-left mx-auto flex flex-col items-center justify-center">
 		<ErrorBoundary>

@@ -56,6 +56,7 @@ import { IStorageService, StorageScope } from '../../../../../../../platform/sto
 import { OPT_OUT_KEY } from '../../../../common/storageKeys.js'
 import { IRepoIndexerService } from '../../../repoIndexerService.js'
 import { ISecretDetectionService } from '../../../../common/secretDetectionService.js'
+import { ILocalSetupService } from '../../../../common/localSetupService.js'
 
 
 // normally to do this you'd use a useEffect that calls .onDidChangeState(), but useEffect mounts too late and misses initial state changes
@@ -235,6 +236,7 @@ const getReactAccessor = (accessor: ServicesAccessor) => {
 			IMCPService: accessor.get(IMCPService),
 			IRepoIndexerService: accessor.get(IRepoIndexerService),
 			ISecretDetectionService: accessor.get(ISecretDetectionService),
+			ILocalSetupService: accessor.get(ILocalSetupService),
 
 			IStorageService: accessor.get(IStorageService),
 

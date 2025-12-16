@@ -33,6 +33,8 @@ import { truncate } from '../../../../base/common/strings.js';
 import { THREAD_STORAGE_KEY } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { PreparedPromptState } from './preparedPromptState.js';
+import { compactToolResult, isLocalProviderForCompaction } from './toolResultCompaction.js';
+import { getToolParallelMetadata, isToolParallelSafe, getToolMaxConcurrency } from '../common/toolParallelMetadata.js';
 import { timeout } from '../../../../base/common/async.js';
 import { deepClone } from '../../../../base/common/objects.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
@@ -2538,8 +2540,96 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 		return {}
 	};
 
+	/**
+	 * Part E: Execute multiple tool calls in parallel when safe
+	 * Groups tools by parallel safety and executes them with concurrency limits
+	 */
+	private async _runToolCallsParallel = async (
+		threadId: string,
+		toolCalls: Array<{ name: ToolName; id: string; rawParams: RawToolParamsObj; mcpServerName?: string }>,
+	): Promise<Array<{ toolId: string; awaitingUserApproval?: boolean; interrupted?: boolean; error?: string }>> => {
+		// Group tools by parallel safety
+		const parallelSafe: typeof toolCalls = [];
+		const sequential: typeof toolCalls = [];
 
+		for (const toolCall of toolCalls) {
+			if (isToolParallelSafe(toolCall.name)) {
+				parallelSafe.push(toolCall);
+			} else {
+				sequential.push(toolCall);
+			}
+		}
 
+		const results: Array<{ toolId: string; awaitingUserApproval?: boolean; interrupted?: boolean; error?: string }> = [];
+
+		// Execute parallel-safe tools with concurrency limits
+		if (parallelSafe.length > 0) {
+			// Group by tool name to apply per-tool concurrency limits
+			const toolGroups = new Map<string, typeof parallelSafe>();
+			for (const toolCall of parallelSafe) {
+				if (!toolGroups.has(toolCall.name)) {
+					toolGroups.set(toolCall.name, []);
+				}
+				toolGroups.get(toolCall.name)!.push(toolCall);
+			}
+
+			// Execute each tool group with its concurrency limit
+			for (const [toolName, group] of toolGroups.entries()) {
+				const maxConcurrency = getToolMaxConcurrency(toolName) || 5; // Default: 5 concurrent
+				let activeCount = 0;
+				const activePromises: Promise<void>[] = [];
+
+				const executeWithSemaphore = async (toolCall: typeof toolCalls[0]) => {
+					// Wait for semaphore slot
+					while (activeCount >= maxConcurrency) {
+						await new Promise(resolve => setTimeout(resolve, 10));
+					}
+					activeCount++;
+
+					try {
+						const mcpTools = this._mcpService.getMCPTools();
+						const mcpTool = mcpTools?.find(t => t.name === toolCall.name);
+						const result = await this._runToolCall(
+							threadId,
+							toolCall.name,
+							toolCall.id,
+							toolCall.mcpServerName || mcpTool?.mcpServerName,
+							{ preapproved: false, unvalidatedToolParams: toolCall.rawParams }
+						);
+						results.push({ toolId: toolCall.id, ...result });
+					} catch (error) {
+						results.push({ toolId: toolCall.id, error: error instanceof Error ? error.message : String(error) });
+					} finally {
+						activeCount--;
+					}
+				};
+
+				// Execute all tools in this group in parallel (with concurrency limit)
+				const groupPromises = group.map(executeWithSemaphore);
+				await Promise.all(groupPromises);
+			}
+		}
+
+		// Execute sequential tools one by one
+		for (const toolCall of sequential) {
+			try {
+				const mcpTools = this._mcpService.getMCPTools();
+				const mcpTool = mcpTools?.find(t => t.name === toolCall.name);
+				const result = await this._runToolCall(
+					threadId,
+					toolCall.name,
+					toolCall.id,
+					toolCall.mcpServerName || mcpTool?.mcpServerName,
+					{ preapproved: false, unvalidatedToolParams: toolCall.rawParams }
+				);
+				results.push({ toolId: toolCall.id, ...result });
+			} catch (error) {
+				results.push({ toolId: toolCall.id, error: error instanceof Error ? error.message : String(error) });
+			}
+		}
+
+		return results;
+	};
 
 	private async _runChatAgent({
 		threadId,
@@ -2897,10 +2987,11 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 			chatLatencyAudit.markPromptAssemblyStart(finalRequestId)
 
 			// Part B: Incremental Prompt Pipeline - use PreparedPromptState for tool turns
+			// Part C: Tool schema build timing will be tracked in sendLLMMessage
 			const timingStart = performance.now();
 			let promptPrepareMs = 0;
 			let tokenCountMs = 0;
-			let toolSchemaBuildMs = 0;
+			let toolSchemaBuildMs = 0; // Will be set from sendLLMMessage if available
 
 			// Get repoIndexer results if promise is available (for cache key)
 			let repoIndexerResults: { results: string[]; metrics: any } | null | undefined = undefined;
@@ -2947,9 +3038,20 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 						if (msg.role === 'tool') {
 							const toolMsg = msg as ToolMessage<ToolName>;
 							if (toolMsg.type === 'success' || toolMsg.type === 'tool_error') {
+								// Part D: Compact tool results for local providers
+								let content = toolMsg.content;
+								if (modelSelection && isLocalProviderForCompaction(modelSelection.providerName)) {
+									const compacted = compactToolResult(content, toolMsg.name);
+									content = compacted.compacted;
+									// Store original in metadata for UI (if needed)
+									if (compacted.wasCompacted) {
+										// Original content is still in toolMsg, UI can access it
+									}
+								}
+
 								toolResults.push({
 									role: 'tool',
-									content: toolMsg.content,
+									content,
 									tool_call_id: toolMsg.id,
 								});
 							}

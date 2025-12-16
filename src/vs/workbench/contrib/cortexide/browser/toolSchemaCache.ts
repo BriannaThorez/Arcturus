@@ -5,7 +5,7 @@
 
 /**
  * Part C: Tool Schema Cache
- * 
+ *
  * Caches tool schemas in different provider formats (OpenAI, Anthropic, Gemini)
  * to avoid rebuilding them on every request.
  */

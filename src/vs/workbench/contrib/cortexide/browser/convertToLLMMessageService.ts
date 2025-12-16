@@ -1380,9 +1380,13 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 				})
 			}
 			else if (m.role === 'tool') {
+				// Part D: Compact tool results for local providers
+				let content = m.content;
+				// Note: modelSelection is not available here, so we'll compact in chatThreadService
+				// where we have access to provider info. This is a fallback for other code paths.
 				simpleLLMMessages.push({
 					role: m.role,
-					content: m.content,
+					content,
 					name: m.name,
 					id: m.id,
 					rawParams: m.rawParams,

@@ -3,7 +3,7 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import React, { useCallback, useEffect, useMemo, useState, useRef } from 'react'; // Added useRef import just in case it was missed, though likely already present
+import React, { useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import { ProviderName, SettingName, displayInfoOfSettingName, providerNames, CortexideStatefulModelInfo, customSettingNamesOfProvider, RefreshableProviderName, refreshableProviderNames, displayInfoOfProviderName, nonlocalProviderNames, localProviderNames, GlobalSettingName, featureNames, displayInfoOfFeatureName, isProviderNameDisabled, FeatureName, hasDownloadButtonsOnModelsProviderNames, subTextMdOfProviderName } from '../../../../common/cortexideSettingsTypes.js'
 import ErrorBoundary from '../sidebar-tsx/ErrorBoundary.js'
 import { VoidButtonBgDarken, VoidCustomDropdownBox, VoidInputBox2, VoidSimpleInputBox, VoidSwitch } from '../util/inputs.js'
@@ -28,6 +28,7 @@ import { generateUuid } from '../../../../../../../base/common/uuid.js'
 type Tab =
 	| 'models'
 	| 'localProviders'
+	| 'localModels'
 	| 'providers'
 	| 'featureOptions'
 	| 'mcp'
@@ -1357,6 +1358,106 @@ export const OllamaSetupInstructions = ({ sayWeAutoDetect }: { sayWeAutoDetect?:
 }
 
 
+const LocalModelsPanel = () => {
+	const accessor = useAccessor();
+	const localSetupService = accessor.get('ILocalSetupService');
+	const settingsState = useSettingsState();
+	const [systemCheck, setSystemCheck] = useState<any>(null);
+	const [verificationResults, setVerificationResults] = useState<any>(null);
+
+	useEffect(() => {
+		// Check system status on mount
+		localSetupService.checkSystem().then(setSystemCheck).catch(() => {});
+	}, []);
+
+	const handleRunVerification = async () => {
+		try {
+			const results = await localSetupService.verifyCapabilities();
+			setVerificationResults(results);
+		} catch (error) {
+			console.error('Verification failed:', error);
+		}
+	};
+
+	const ollamaModels = settingsState.settingsOfProvider.ollama.models;
+	const ollamaRunning = systemCheck?.ollamaRunning ?? false;
+
+	return (
+		<div className="space-y-6">
+			{/* Status Card */}
+			<div className="rounded-2xl border border-void-border-3 bg-void-bg-3/60 p-6">
+				<h3 className="text-xl font-medium text-void-fg-0 mb-4">Status</h3>
+				<div className="space-y-3">
+					<div className="flex items-center justify-between">
+						<span className="text-void-fg-2">Ollama Running</span>
+						{ollamaRunning ? (
+							<span className="flex items-center gap-2 text-emerald-400">
+								<Check className="w-4 h-4" /> Yes
+							</span>
+						) : (
+							<span className="flex items-center gap-2 text-rose-500">
+								<X className="w-4 h-4" /> No
+							</span>
+						)}
+					</div>
+					<div className="flex items-center justify-between">
+						<span className="text-void-fg-2">Models Installed</span>
+						<span className="text-void-fg-1">{ollamaModels.length}</span>
+					</div>
+					{systemCheck?.diskSpaceGb !== null && (
+						<div className="flex items-center justify-between">
+							<span className="text-void-fg-2">Disk Space</span>
+							<span className="text-void-fg-1">{systemCheck.diskSpaceGb.toFixed(1)} GB</span>
+						</div>
+					)}
+				</div>
+			</div>
+
+			{/* Installed Models */}
+			<div className="rounded-2xl border border-void-border-3 bg-void-bg-3/60 p-6">
+				<h3 className="text-xl font-medium text-void-fg-0 mb-4">Installed Models</h3>
+				{ollamaModels.length > 0 ? (
+					<div className="space-y-2">
+						{ollamaModels.map((model) => (
+							<div key={model.modelName} className="flex items-center justify-between p-3 rounded-xl border border-void-border-4 bg-void-bg-2">
+								<span className="text-void-fg-1">{model.modelName}</span>
+								<span className="text-xs text-void-fg-4">{model.type}</span>
+							</div>
+						))}
+					</div>
+				) : (
+					<p className="text-void-fg-3">No models installed. Use the Local Setup Wizard to install models.</p>
+				)}
+			</div>
+
+			{/* Diagnostics */}
+			<div className="rounded-2xl border border-void-border-3 bg-void-bg-3/60 p-6">
+				<h3 className="text-xl font-medium text-void-fg-0 mb-4">Diagnostics</h3>
+				<div className="space-y-3">
+					<button
+						onClick={handleRunVerification}
+						className="px-4 py-2 rounded-xl border border-void-border-2 bg-void-bg-2 text-void-fg-1 hover:bg-void-bg-3 transition-colors"
+					>
+						Run Verification Tests
+					</button>
+					{verificationResults && (
+						<div className="mt-4 space-y-2">
+							<div className="flex items-center gap-2">
+								{verificationResults.chat.passed ? <Check className="w-4 h-4 text-emerald-400" /> : <X className="w-4 h-4 text-rose-500" />}
+								<span className="text-void-fg-2">Chat: {verificationResults.chat.passed ? 'Passed' : 'Failed'}</span>
+							</div>
+							<div className="flex items-center gap-2">
+								{verificationResults.toolCalling.passed ? <Check className="w-4 h-4 text-emerald-400" /> : <X className="w-4 h-4 text-rose-500" />}
+								<span className="text-void-fg-2">Tool Calling: {verificationResults.toolCalling.passed ? 'Passed' : 'Failed'}</span>
+							</div>
+						</div>
+					)}
+				</div>
+			</div>
+		</div>
+	);
+};
+
 const RedoOnboardingButton = ({ className }: { className?: string }) => {
 	const accessor = useAccessor()
 	const cortexideSettingsService = accessor.get('ICortexideSettingsService')
@@ -1559,6 +1660,7 @@ export const Settings = () => {
 	const navItems: { tab: Tab; label: string }[] = [
 		{ tab: 'models', label: 'Models' },
 		{ tab: 'localProviders', label: 'Local Providers' },
+		{ tab: 'localModels', label: 'Local Models' },
 		{ tab: 'providers', label: 'Main Providers' },
 		{ tab: 'featureOptions', label: 'Feature Options' },
 		{ tab: 'general', label: 'General' },
@@ -1721,6 +1823,14 @@ export const Settings = () => {
 									</div>
 
 									<VoidProviderSettings providerNames={localProviderNames} />
+								</ErrorBoundary>
+							</div>
+
+							{/* Local Models section */}
+							<div className={shouldShowTab('localModels') ? `` : 'hidden'}>
+								<ErrorBoundary>
+									<h2 className={`text-3xl mb-2`}>Local Models</h2>
+									<LocalModelsPanel />
 								</ErrorBoundary>
 							</div>
 
