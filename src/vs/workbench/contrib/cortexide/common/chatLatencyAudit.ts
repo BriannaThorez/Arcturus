@@ -28,6 +28,15 @@ export interface ChatLatencyMetrics {
 	tokenizationTime: number; // Time to tokenize prompt (ms)
 	firstChunkProcessTime: number; // Time to process first chunk (ms)
 
+	// Tool turn timing metrics (Part A - instrumentation)
+	promptPrepareMs?: number; // Time to prepare prompt (ms)
+	tokenCountMs?: number; // Time to count tokens (ms)
+	toolSchemaBuildMs?: number; // Time to build tool schemas (ms)
+	llmNetworkMs?: number; // Time for LLM network request (ms)
+	toolExecuteMs?: number; // Time to execute tools (ms)
+	toolResultInjectMs?: number; // Time to inject tool results (ms)
+	totalToolTurnMs?: number; // Total time for tool turn (ms)
+
 	// Token metrics
 	promptTokens: number;
 	attachmentTokens: number;
@@ -95,6 +104,17 @@ export interface LatencyAuditContext {
 	// Provider
 	providerName: string;
 	modelName: string;
+
+	// Tool turn timing (Part A - instrumentation)
+	toolTurnTimings?: Array<{
+		promptPrepareMs: number;
+		tokenCountMs: number;
+		toolSchemaBuildMs: number;
+		llmNetworkMs: number;
+		toolExecuteMs: number;
+		toolResultInjectMs: number;
+		totalToolTurnMs: number;
+	}>;
 }
 
 export class ChatLatencyAudit {
@@ -334,6 +354,26 @@ export class ChatLatencyAudit {
 			? (context.renderFrameCount / renderDuration) * 1000
 			: 0;
 
+		// Calculate tool turn timing averages if available
+		let promptPrepareMs: number | undefined;
+		let tokenCountMs: number | undefined;
+		let toolSchemaBuildMs: number | undefined;
+		let llmNetworkMs: number | undefined;
+		let toolExecuteMs: number | undefined;
+		let toolResultInjectMs: number | undefined;
+		let totalToolTurnMs: number | undefined;
+
+		if (context.toolTurnTimings && context.toolTurnTimings.length > 0) {
+			const timings = context.toolTurnTimings;
+			promptPrepareMs = timings.reduce((sum, t) => sum + t.promptPrepareMs, 0) / timings.length;
+			tokenCountMs = timings.reduce((sum, t) => sum + t.tokenCountMs, 0) / timings.length;
+			toolSchemaBuildMs = timings.reduce((sum, t) => sum + t.toolSchemaBuildMs, 0) / timings.length;
+			llmNetworkMs = timings.reduce((sum, t) => sum + t.llmNetworkMs, 0) / timings.length;
+			toolExecuteMs = timings.reduce((sum, t) => sum + t.toolExecuteMs, 0) / timings.length;
+			toolResultInjectMs = timings.reduce((sum, t) => sum + t.toolResultInjectMs, 0) / timings.length;
+			totalToolTurnMs = timings.reduce((sum, t) => sum + t.totalToolTurnMs, 0) / timings.length;
+		}
+
 		return {
 			ttfs,
 			tts,
@@ -361,6 +401,13 @@ export class ChatLatencyAudit {
 			modelName: context.modelName,
 			requestId: context.requestId,
 			timestamp: context.startTime,
+			promptPrepareMs,
+			tokenCountMs,
+			toolSchemaBuildMs,
+			llmNetworkMs,
+			toolExecuteMs,
+			toolResultInjectMs,
+			totalToolTurnMs,
 		};
 	}
 
@@ -440,6 +487,45 @@ export class ChatLatencyAudit {
 	}
 
 	/**
+	 * Record tool turn timing metrics (Part A - instrumentation)
+	 * Only logs in dev builds or behind debug flag
+	 */
+	recordToolTurnTiming(
+		requestId: string,
+		timing: {
+			promptPrepareMs: number;
+			tokenCountMs: number;
+			toolSchemaBuildMs: number;
+			llmNetworkMs: number;
+			toolExecuteMs: number;
+			toolResultInjectMs: number;
+			totalToolTurnMs: number;
+		}
+	): void {
+		const context = this.contexts.get(requestId);
+		if (context) {
+			if (!context.toolTurnTimings) {
+				context.toolTurnTimings = [];
+			}
+			context.toolTurnTimings.push(timing);
+
+			// Log only in dev builds (check for debug flag or dev environment)
+			const isDev = typeof process !== 'undefined' && (process.env.NODE_ENV === 'development' || process.env.DEBUG);
+			if (isDev) {
+				console.debug(`[Tool Turn Timing] Request ${requestId}:`, {
+					promptPrepare: `${timing.promptPrepareMs.toFixed(2)}ms`,
+					tokenCount: `${timing.tokenCountMs.toFixed(2)}ms`,
+					toolSchemaBuild: `${timing.toolSchemaBuildMs.toFixed(2)}ms`,
+					llmNetwork: `${timing.llmNetworkMs.toFixed(2)}ms`,
+					toolExecute: `${timing.toolExecuteMs.toFixed(2)}ms`,
+					toolResultInject: `${timing.toolResultInjectMs.toFixed(2)}ms`,
+					total: `${timing.totalToolTurnMs.toFixed(2)}ms`,
+				});
+			}
+		}
+	}
+
+	/**
 	 * Format metrics as a report string
 	 */
 	formatReport(metrics: ChatLatencyMetrics): string {
@@ -455,6 +541,11 @@ export class ChatLatencyAudit {
 		lines.push(`Tokens: ${metrics.totalInputTokens} in / ${metrics.outputTokens} out`);
 		lines.push(`Context: ${metrics.contextSize} chars${metrics.contextTruncated ? ' (truncated)' : ''}`);
 		lines.push(`Render: ${metrics.renderFPS.toFixed(1)} FPS (${metrics.droppedFrames} dropped)`);
+		if (metrics.promptPrepareMs !== undefined) {
+			lines.push(`Tool Turn - Prompt Prepare: ${metrics.promptPrepareMs.toFixed(2)}ms`);
+			lines.push(`Tool Turn - Tool Schema Build: ${metrics.toolSchemaBuildMs?.toFixed(2)}ms`);
+			lines.push(`Tool Turn - Total: ${metrics.totalToolTurnMs?.toFixed(2)}ms`);
+		}
 		return lines.join('\n');
 	}
 

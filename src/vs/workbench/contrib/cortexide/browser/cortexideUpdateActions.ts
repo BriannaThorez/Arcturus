@@ -1,7 +1,7 @@
-/*--------------------------------------------------------------------------------------
+/*---------------------------------------------------------------------------------------------
  *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
- *--------------------------------------------------------------------------------------*/
+ *--------------------------------------------------------------------------------------------*/
 
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import Severity from '../../../../base/common/severity.js';
@@ -16,65 +16,83 @@ import * as dom from '../../../../base/browser/dom.js';
 import { IUpdateService } from '../../../../platform/update/common/update.js';
 import { CortexideCheckUpdateResponse } from '../common/cortexideUpdateServiceTypes.js';
 import { IAction } from '../../../../base/common/actions.js';
+import { INativeHostService } from '../../../../platform/native/common/native.js';
 
 
 
 
-const notifyUpdate = (res: CortexideCheckUpdateResponse & { message: string }, notifService: INotificationService, updateService: IUpdateService): INotificationHandle => {
-    const message = res?.message || 'This is a very old version. Please download the latest CortexIDE!'
+const notifyUpdate = (
+	res: CortexideCheckUpdateResponse & { message: string },
+	notifService: INotificationService,
+	updateService: IUpdateService,
+	cortexideUpdateService: ICortexideUpdateService,
+	nativeHostService: INativeHostService
+): INotificationHandle => {
+	const message = res?.message || 'This is a very old version. Please download the latest CortexIDE!'
+
+	// Format message with version if available
+	let displayMessage = message;
+	if (res.version) {
+		displayMessage = `Update available: ${res.version}\n${message}`;
+	}
+
+	// Extract release notes snippet (first 200 chars)
+	let releaseNotesSnippet: string | undefined;
+	if (res.releaseNotes) {
+		const cleanNotes = res.releaseNotes.replace(/[#*`]/g, '').trim();
+		releaseNotesSnippet = cleanNotes.length > 200
+			? cleanNotes.substring(0, 200) + '...'
+			: cleanNotes;
+	}
 
 	let actions: INotificationActions | undefined
 
 	if (res?.action) {
 		const primary: IAction[] = []
 
-		if (res.action === 'reinstall') {
+		if (res.action === 'reinstall' || res.action === 'download') {
 			primary.push({
-				label: `Reinstall`,
-				id: 'void.updater.reinstall',
-				enabled: true,
-				tooltip: '',
-				class: undefined,
-				run: () => {
-					const { window } = dom.getActiveWindow()
-					window.open('https://voideditor.com/download-beta')
-				}
-			})
-		}
-
-		if (res.action === 'download') {
-			primary.push({
-				label: `Download`,
+				label: `Download & Install`,
 				id: 'void.updater.download',
 				enabled: true,
-				tooltip: '',
+				tooltip: 'Download the latest version from GitHub Releases',
 				class: undefined,
-				run: () => {
-					updateService.downloadUpdate()
+				run: async () => {
+					// Open GitHub Releases page
+					const { window } = dom.getActiveWindow()
+					window.open('https://github.com/OpenCortexIDE/cortexide/releases/latest')
+
+					// Also try to trigger built-in download if available
+					try {
+						if (updateService.state.type === 'available for download') {
+							await updateService.downloadUpdate()
+						}
+					} catch (error) {
+						// Ignore errors, user can download manually
+					}
 				}
 			})
 		}
-
 
 		if (res.action === 'apply') {
 			primary.push({
-				label: `Apply`,
+				label: `Apply Update`,
 				id: 'void.updater.apply',
 				enabled: true,
-				tooltip: '',
+				tooltip: 'Apply the downloaded update',
 				class: undefined,
-				run: () => {
-					updateService.applyUpdate()
+				run: async () => {
+					await updateService.applyUpdate()
 				}
 			})
 		}
 
 		if (res.action === 'restart') {
 			primary.push({
-				label: `Restart`,
+				label: `Restart to Update`,
 				id: 'void.updater.restart',
 				enabled: true,
-				tooltip: '',
+				tooltip: 'Restart CortexIDE to apply the update',
 				class: undefined,
 				run: () => {
 					updateService.quitAndInstall()
@@ -82,52 +100,76 @@ const notifyUpdate = (res: CortexideCheckUpdateResponse & { message: string }, n
 			})
 		}
 
-        primary.push({
-            id: 'void.updater.site',
-            enabled: true,
-            label: `CortexIDE Site`,
-            tooltip: '',
-            class: undefined,
-            run: () => {
-                const { window } = dom.getActiveWindow()
-                window.open('https://cortexide.com/')
-            }
-        })
+		// View release notes action
+		if (res.releaseNotes) {
+			primary.push({
+				id: 'void.updater.releasenotes',
+				enabled: true,
+				label: `View Release Notes`,
+				tooltip: 'View full release notes on GitHub',
+				class: undefined,
+				run: () => {
+					const { window } = dom.getActiveWindow()
+					const version = res.version || 'latest'
+					window.open(`https://github.com/OpenCortexIDE/cortexide/releases/tag/${version}`)
+				}
+			})
+		}
+
+		const secondary: IAction[] = [
+			{
+				id: 'void.updater.remindlater',
+				enabled: true,
+				label: `Remind me later`,
+				tooltip: 'Remind me about this update in 24 hours',
+				class: undefined,
+				run: async () => {
+					await cortexideUpdateService.setRemindLater()
+					notifController.close()
+				}
+			},
+			{
+				id: 'void.updater.close',
+				enabled: true,
+				label: `Dismiss`,
+				tooltip: 'Dismiss this update notification',
+				class: undefined,
+				run: async () => {
+					if (res.version) {
+						await cortexideUpdateService.dismissVersion(res.version)
+					}
+					notifController.close()
+				}
+			}
+		]
 
 		actions = {
 			primary: primary,
-			secondary: [{
-				id: 'void.updater.close',
-				enabled: true,
-				label: `Keep current version`,
-				tooltip: '',
-				class: undefined,
-				run: () => {
-					notifController.close()
-				}
-			}]
+			secondary: secondary,
 		}
 	}
 	else {
 		actions = undefined
 	}
 
+	// Build full message with release notes snippet
+	let fullMessage = displayMessage;
+	if (releaseNotesSnippet) {
+		fullMessage += `\n\n${releaseNotesSnippet}`;
+	}
+
 	const notifController = notifService.notify({
 		severity: Severity.Info,
-		message: message,
+		message: fullMessage,
 		sticky: true,
 		progress: actions ? { worked: 0, total: 100 } : undefined,
 		actions: actions,
 	})
 
 	return notifController
-	// const d = notifController.onDidClose(() => {
-	// 	notifyYesUpdate(notifService, res)
-	// 	d.dispose()
-	// })
 }
 const notifyErrChecking = (notifService: INotificationService): INotificationHandle => {
-    const message = `There was an error checking for updates. If this persists, please reinstall CortexIDE.`
+	const message = `There was an error checking for updates. If this persists, please reinstall CortexIDE.`
 	const notifController = notifService.notify({
 		severity: Severity.Info,
 		message: message,
@@ -143,6 +185,7 @@ const performVoidCheck = async (
 	cortexideUpdateService: ICortexideUpdateService,
 	metricsService: IMetricsService,
 	updateService: IUpdateService,
+	nativeHostService: INativeHostService,
 ): Promise<INotificationHandle | null> => {
 
 	const metricsTag = explicit ? 'Manual' : 'Auto'
@@ -156,7 +199,7 @@ const performVoidCheck = async (
 	}
 	else {
 		if (res.message) {
-			const notifController = notifyUpdate(res, notifService, updateService)
+			const notifController = notifyUpdate(res, notifService, updateService, cortexideUpdateService, nativeHostService)
 			metricsService.capture(`CortexIDE Update ${metricsTag}: Yes`, { res })
 			return notifController
 		}
@@ -177,7 +220,7 @@ registerAction2(class extends Action2 {
 		super({
 			f1: true,
 			id: 'void.voidCheckUpdate',
-            title: localize2('voidCheckUpdate', 'CortexIDE: Check for Updates'),
+			title: localize2('voidCheckUpdate', 'CortexIDE: Check for Updates'),
 		});
 	}
 	async run(accessor: ServicesAccessor): Promise<void> {
@@ -185,10 +228,11 @@ registerAction2(class extends Action2 {
 		const notifService = accessor.get(INotificationService)
 		const metricsService = accessor.get(IMetricsService)
 		const updateService = accessor.get(IUpdateService)
+		const nativeHostService = accessor.get(INativeHostService)
 
 		const currNotifController = lastNotifController
 
-		const newController = await performVoidCheck(true, notifService, cortexideUpdateService, metricsService, updateService)
+		const newController = await performVoidCheck(true, notifService, cortexideUpdateService, metricsService, updateService, nativeHostService)
 
 		if (newController) {
 			currNotifController?.close()
@@ -205,11 +249,12 @@ class VoidUpdateWorkbenchContribution extends Disposable implements IWorkbenchCo
 		@IMetricsService metricsService: IMetricsService,
 		@INotificationService notifService: INotificationService,
 		@IUpdateService updateService: IUpdateService,
+		@INativeHostService nativeHostService: INativeHostService,
 	) {
 		super()
 
 		const autoCheck = () => {
-			performVoidCheck(false, notifService, cortexideUpdateService, metricsService, updateService)
+			performVoidCheck(false, notifService, cortexideUpdateService, metricsService, updateService, nativeHostService)
 		}
 
 		// check once 5 seconds after mount
