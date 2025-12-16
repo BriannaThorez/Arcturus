@@ -37,7 +37,7 @@ type Tab =
 
 const ButtonLeftTextRightOption = ({ text, leftButton }: { text: string, leftButton?: React.ReactNode }) => {
 
-	return <div className='flex items-center text-void-fg-3 px-3 py-0.5 rounded-sm overflow-hidden gap-2'>
+	return <div className='flex items-center text-void-fg-3 px-3 py-0.5 rounded-md overflow-hidden gap-2'>
 		{leftButton ? leftButton : null}
 		<span>
 			{text}
@@ -179,7 +179,7 @@ const RefreshableRemoteCatalogs = () => {
 
 
 
-export const AnimatedCheckmarkButton = ({ text, className }: { text?: string, className?: string }) => {
+export const AnimatedCheckmarkButton = ({ text, className, style }: { text?: string, className?: string, style?: React.CSSProperties }) => {
 	const [dashOffset, setDashOffset] = useState(40);
 
 	useEffect(() => {
@@ -204,8 +204,9 @@ export const AnimatedCheckmarkButton = ({ text, className }: { text?: string, cl
 
 	return <div
 		className={`flex items-center gap-1.5 w-fit
-			${className ? className : `px-2 py-0.5 text-xs text-zinc-900 bg-zinc-100 rounded-sm`}
+			${className ? className : `px-2 py-0.5 text-xs text-zinc-900 bg-zinc-100 rounded-md`}
 		`}
+		style={style}
 	>
 		<svg className="size-4" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
 			<path
@@ -229,7 +230,21 @@ const AddButton = ({ disabled, text = 'Add', ...props }: { disabled?: boolean, t
 
 	return <button
 		disabled={disabled}
-		className={`bg-[#0e70c0] px-3 py-1 text-white rounded-sm ${!disabled ? 'hover:bg-[#1177cb] cursor-pointer' : 'opacity-50 cursor-not-allowed bg-opacity-70'}`}
+		className={`void-focus-ring px-3 py-1 rounded-md transition-colors ${!disabled ? 'cursor-pointer' : 'opacity-50 cursor-not-allowed'}`}
+		style={{
+			backgroundColor: disabled ? 'var(--vscode-button-background)' : 'var(--vscode-button-background)',
+			color: 'var(--vscode-button-foreground)',
+		}}
+		onMouseEnter={(e) => {
+			if (!disabled) {
+				e.currentTarget.style.backgroundColor = 'var(--vscode-button-hoverBackground)';
+			}
+		}}
+		onMouseLeave={(e) => {
+			if (!disabled) {
+				e.currentTarget.style.backgroundColor = 'var(--vscode-button-background)';
+			}
+		}}
 		{...props}
 	>{text}</button>
 
@@ -367,7 +382,7 @@ const SimpleModelSettingsDialog = ({
 		>
 			{/* MODAL */}
 			<div
-				className="bg-void-bg-1 rounded-md p-4 max-w-xl w-full shadow-xl overflow-y-auto max-h-[90vh]"
+				className="bg-void-bg-1 rounded-lg p-4 max-w-xl w-full shadow-xl overflow-y-auto max-h-[90vh]"
 				onClick={(e) => e.stopPropagation()} // Keep stopping propagation for normal clicks inside
 				onMouseDown={(e) => {
 					mouseDownInsideModal.current = true;
@@ -409,7 +424,7 @@ const SimpleModelSettingsDialog = ({
 				<textarea
 					key={overrideEnabled + ''}
 					ref={textAreaRef}
-					className={`w-full min-h-[200px] p-2 rounded-sm border border-void-border-2 bg-void-bg-2 resize-none font-mono text-sm ${!overrideEnabled ? 'text-void-fg-3' : ''}`}
+					className={`w-full min-h-[200px] p-2 rounded-md border border-void-border-2 bg-void-bg-2 resize-none font-mono text-sm ${!overrideEnabled ? 'text-void-fg-3' : ''}`}
 					defaultValue={overrideEnabled && currentOverrides ? JSON.stringify(currentOverrides, null, 2) : placeholder}
 					placeholder={placeholder}
 					readOnly={!overrideEnabled}
@@ -425,7 +440,11 @@ const SimpleModelSettingsDialog = ({
 					</VoidButtonBgDarken>
 					<VoidButtonBgDarken
 						onClick={onSave}
-						className="px-3 py-1 bg-[#0e70c0] text-white"
+						className="void-focus-ring px-3 py-1"
+						style={{
+							backgroundColor: 'var(--vscode-button-background)',
+							color: 'var(--vscode-button-foreground)',
+						}}
 					>
 						Save
 					</VoidButtonBgDarken>
@@ -521,15 +540,15 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 
 
 			const detailAboutModel = type === 'autodetected' ?
-				<Asterisk size={14} className="inline-block align-text-top brightness-115 stroke-[2] text-[#0e70c0]" data-tooltip-id='void-tooltip' data-tooltip-place='right' data-tooltip-content='Detected locally' />
+				<Asterisk size={14} className="inline-block align-text-top brightness-115 stroke-[2] text-void-link-color" data-tooltip-id='void-tooltip' data-tooltip-place='right' data-tooltip-content='Detected locally' />
 				: type === 'custom' ?
-					<Asterisk size={14} className="inline-block align-text-top brightness-115 stroke-[2] text-[#0e70c0]" data-tooltip-id='void-tooltip' data-tooltip-place='right' data-tooltip-content='Custom model' />
+					<Asterisk size={14} className="inline-block align-text-top brightness-115 stroke-[2] text-void-link-color" data-tooltip-id='void-tooltip' data-tooltip-place='right' data-tooltip-content='Custom model' />
 					: undefined
 
 			const hasOverrides = !!settingsState.overridesOfModel?.[providerName]?.[modelName]
 
 			return <div key={`${modelName}${providerName}`}
-				className={`flex items-center justify-between gap-4 hover:bg-black/10 dark:hover:bg-gray-300/10 py-1 px-3 rounded-sm overflow-hidden cursor-default truncate group
+				className={`flex items-center justify-between gap-4 hover:bg-black/10 dark:hover:bg-gray-300/10 py-1 px-3 rounded-md overflow-hidden cursor-default truncate group
 				`}
 			>
 				{/* left part is width:full */}
@@ -591,7 +610,10 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 		{/* Add Model Section */}
 		{showCheckmark ? (
 			<div className="mt-4">
-				<AnimatedCheckmarkButton text='Added' className="bg-[#0e70c0] text-white px-3 py-1 rounded-sm" />
+				<AnimatedCheckmarkButton text='Added' className="px-3 py-1 rounded-md" style={{
+					backgroundColor: 'var(--vscode-button-background)',
+					color: 'var(--vscode-button-foreground)',
+				}} />
 			</div>
 		) : isAddModelOpen ? (
 			<div className="mt-4">
@@ -853,7 +875,7 @@ export const AIInstructionsBox = () => {
 	const cortexideSettingsService = accessor.get('ICortexideSettingsService')
 	const voidSettingsState = useSettingsState()
 	return <VoidInputBox2
-		className='min-h-[81px] p-3 rounded-sm'
+		className='min-h-[81px] p-3 rounded-md'
 		initValue={voidSettingsState.globalSettings.aiInstructions}
 		placeholder={`Do not change my indentation or delete my comments. When writing TS or JS, do not add ;'s. Write new code using Rust if possible. `}
 		multiline
@@ -1431,7 +1453,7 @@ const MCPServerComponent = ({ name, server }: { name: string, server: MCPServer 
 	const removeUniquePrefix = (name: string) => name.split('_').slice(1).join('_')
 
 	return (
-		<div className="border border-void-border-2 bg-void-bg-1 py-3 px-4 rounded-sm my-2">
+		<div className="border border-void-border-2 bg-void-bg-1 py-3 px-4 rounded-md my-2">
 			<div className="flex items-center justify-between">
 				{/* Left side - status and name */}
 				<div className="flex items-center gap-2">
@@ -1465,7 +1487,7 @@ const MCPServerComponent = ({ name, server }: { name: string, server: MCPServer 
 							(server.tools ?? []).map((tool: { name: string; description?: string }) => (
 								<span
 									key={tool.name}
-									className="px-2 py-0.5 bg-void-bg-2 text-void-fg-3 rounded-sm text-xs"
+									className="px-2 py-0.5 bg-void-bg-2 text-void-fg-3 rounded-md text-xs"
 
 									data-tooltip-id='void-tooltip'
 									data-tooltip-content={tool.description || ''}
@@ -1485,7 +1507,7 @@ const MCPServerComponent = ({ name, server }: { name: string, server: MCPServer 
 			{isOn && server.command && (
 				<div className="mt-3">
 					<div className="text-xs text-void-fg-3 mb-1">Command:</div>
-					<div className="px-2 py-1 bg-void-bg-2 text-xs font-mono overflow-x-auto whitespace-nowrap text-void-fg-2 rounded-sm">
+					<div className="px-2 py-1 bg-void-bg-2 text-xs font-mono overflow-x-auto whitespace-nowrap text-void-fg-2 rounded-md">
 						{server.command}
 					</div>
 				</div>
@@ -1641,11 +1663,15 @@ export const Settings = () => {
 									}
 								}}
 								className={`
-          py-2 px-4 rounded-md text-left transition-all duration-200
+          void-focus-ring py-2 px-4 rounded-md text-left transition-all duration-200
           ${selectedSection === tab
-										? 'bg-[#0e70c0]/80 text-white font-medium shadow-sm'
-										: 'bg-void-bg-2 hover:bg-void-bg-2/80 text-void-fg-1'}
+										? 'font-medium shadow-sm'
+										: 'bg-void-bg-2 hover:bg-void-bg-2-hover text-void-fg-1'}
         `}
+								style={selectedSection === tab ? {
+									backgroundColor: 'var(--vscode-button-background)',
+									color: 'var(--vscode-button-foreground)',
+								} : undefined}
 							>
 								{label}
 							</button>

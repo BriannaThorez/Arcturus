@@ -43,7 +43,7 @@ export const VoidOnboarding = () => {
 			<div
 				className={`
 					fixed inset-0 z-[99999] flex items-start justify-center px-6 py-12
-					bg-[#050507]
+					bg-void-bg-1
 					backdrop-blur-[28px]
 					overflow-y-auto
 					transition-all duration-700 ease-in-out

@@ -22,7 +22,7 @@ import { ChatMode, displayInfoOfProviderName, FeatureName, isFeatureNameDisabled
 import { ICommandService } from '../../../../../../../platform/commands/common/commands.js';
 import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState, getReservedOutputTokenSpace } from '../../../../common/modelCapabilities.js';
-import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text, Image as ImageIcon, FileText } from 'lucide-react';
+import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text, Image as ImageIcon, FileText, Plus } from 'lucide-react';
 import { ChatMessage, CheckpointEntry, StagingSelectionItem, ToolMessage, PlanMessage, ReviewMessage, PlanStep, StepStatus, PlanApprovalState } from '../../../../common/chatThreadServiceTypes.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, ToolName, LintErrorItem, ToolApprovalType, toolApprovalTypes } from '../../../../common/toolsServiceTypes.js';
 import { CopyButton, EditToolAcceptRejectButtonsHTML, IconShell1, JumpToFileButton, JumpToTerminalButton, StatusIndicator, StatusIndicatorForApplyButton, useApplyStreamState, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
@@ -503,10 +503,10 @@ export const VoidChatArea: React.FC<CortexideChatAreaProps> = ({
 				gap-x-1
                 flex flex-col p-2.5 relative input text-left shrink-0
                 rounded-2xl
-                bg-[#030304]
+                bg-void-bg-1
 				transition-all duration-200
-				border border-[rgba(255,255,255,0.08)] focus-within:border-[rgba(255,255,255,0.12)] hover:border-[rgba(255,255,255,0.12)]
-				${isDragOver ? 'border-blue-500 bg-blue-500/10' : ''}
+				border border-void-border-3 focus-within:border-void-border-2 hover:border-void-border-2
+				${isDragOver ? 'border-void-link-color bg-void-link-color/10' : ''}
 				max-h-[80vh] overflow-y-auto
                 ${className}
             `}
@@ -892,7 +892,7 @@ export const SelectedFiles = (
 								w-fit h-fit
 								select-none
 								text-xs text-nowrap
-								border rounded-sm
+								border rounded-md
 								${isThisSelectionProspective ? 'bg-void-bg-1 text-void-fg-3 opacity-80' : 'bg-void-bg-1 hover:brightness-95 text-void-fg-1'}
 								${isThisSelectionProspective
 									? 'border-void-border-2'
@@ -1103,7 +1103,7 @@ const ToolHeaderWrapper = ({
 			{/* children */}
 			{<div
 				className={`overflow-hidden transition-all duration-200 ease-in-out ${isExpanded ? 'opacity-100 py-1' : 'max-h-0 opacity-0'}
-					text-void-fg-4 rounded-sm overflow-x-auto
+					text-void-fg-4 rounded-md overflow-x-auto
 				  `}
 			//    bg-black bg-opacity-10 border border-void-border-4 border-opacity-50
 			>
@@ -4759,7 +4759,7 @@ export const SidebarChat = () => {
 
     const landingPageContent = <div
 		ref={sidebarRef}
-		className='w-full h-full max-h-full flex flex-col overflow-auto px-3'
+		className='w-full h-full flex flex-col overflow-auto px-3'
 	>
 		<ErrorBoundary>
 			{landingPageInput}
@@ -4815,13 +4815,156 @@ export const SidebarChat = () => {
 		</ErrorBoundary>
 	</div>
 
+	// Chat Tabs Bar Component - displays all threads as tabs
+	const ChatTabsBar = () => {
+		// Only show recent/active threads as tabs (limit to most recent 10)
+		// This prevents showing all historical chats as tabs on startup
+		const MAX_TABS_TO_SHOW = 10
+		const allThreadIds = Object.keys(chatThreadsState.allThreads)
+			.filter(threadId => {
+				const thread = chatThreadsState.allThreads[threadId]
+				// Always include the current thread
+				if (threadId === chatThreadsState.currentThreadId) return true
+				// Only include threads that have messages (active chats)
+				return thread && thread.messages.length > 0
+			})
+			.sort((a, b) => {
+				const threadA = chatThreadsState.allThreads[a]
+				const threadB = chatThreadsState.allThreads[b]
+				if (!threadA || !threadB) return 0
+				return new Date(threadB.lastModified).getTime() - new Date(threadA.lastModified).getTime()
+			})
+			.slice(0, MAX_TABS_TO_SHOW) // Limit to most recent 10 tabs
+
+		const getThreadTitle = (threadId: string) => {
+			const thread = chatThreadsState.allThreads[threadId]
+			if (!thread) return 'New Chat'
+			const firstUserMsg = thread.messages.find(msg => msg.role === 'user')
+			if (firstUserMsg && firstUserMsg.displayContent) {
+				const title = firstUserMsg.displayContent.trim()
+				return title.length > 28 ? title.substring(0, 28) + '...' : title
+			}
+			return 'New Chat'
+		}
+
+
+		const handleCloseTab = useCallback((e: React.MouseEvent, threadId: string) => {
+			e.stopPropagation()
+			const allThreadIds = Object.keys(chatThreadsState.allThreads)
+
+			// If this is the last tab, don't close it (always keep at least one tab)
+			if (allThreadIds.length === 1) {
+				return
+			}
+
+			// If this is the active tab, switch to another one first
+			if (threadId === chatThreadsState.currentThreadId) {
+				const otherThreadId = allThreadIds.find(id => id !== threadId)
+				if (otherThreadId) {
+					chatThreadsService.switchToThread(otherThreadId)
+				}
+			}
+
+			// Delete the thread
+			chatThreadsService.deleteThread(threadId)
+		}, [chatThreadsService, chatThreadsState])
+
+		return (
+			<div className='w-full flex items-center border-b border-void-border-3/60 bg-void-bg-2 flex-shrink-0' style={{ height: '48px' }}>
+				<div
+					className='flex items-center flex-1 min-w-0 overflow-x-auto scrollbar-thin scrollbar-thumb-void-border-3 scrollbar-track-transparent'
+					style={{
+						scrollbarWidth: 'thin',
+						scrollbarColor: 'var(--void-border-3) transparent'
+					}}
+				>
+					{allThreadIds.map((threadId, index) => {
+						const isActive = threadId === chatThreadsState.currentThreadId
+						const isLast = index === allThreadIds.length - 1
+						const title = getThreadTitle(threadId)
+						const thread = chatThreadsState.allThreads[threadId]
+						const hasMessages = thread && thread.messages.length > 0
+						const messageCount = thread ? thread.messages.filter(m => m.role === 'user' || m.role === 'assistant').length : 0
+
+						return (
+							<div
+								key={threadId}
+								className={`
+									group relative flex items-center gap-1.5 flex-shrink-0 whitespace-nowrap
+									px-4 py-2.5 text-xs
+									transition-all duration-200 ease-out
+									${!isLast ? 'border-r border-void-border-3/50' : ''}
+									${isActive
+										? 'bg-void-bg-1 text-void-fg-1 font-medium'
+										: 'bg-transparent text-void-fg-3 hover:text-void-fg-2 hover:bg-void-bg-3/40'
+									}
+								`}
+							>
+								<button
+									onClick={() => chatThreadsService.switchToThread(threadId)}
+									className='flex items-center gap-2 flex-1 min-w-0 outline-none focus-visible:ring-2 focus-visible:ring-void-link-color/50 focus-visible:ring-offset-1'
+									title={title}
+									type='button'
+								>
+									<span className={`truncate max-w-[200px] ${isActive ? 'text-void-fg-1' : 'text-void-fg-3'}`}>
+										{title}
+									</span>
+									{hasMessages && messageCount > 0 && (
+										<span className={`
+											text-[10px] px-1.5 py-0.5 font-medium flex-shrink-0
+											${isActive
+												? 'bg-void-link-color/20 text-void-link-color'
+												: 'bg-void-bg-2/60 text-void-fg-4 group-hover:bg-void-bg-2/80 group-hover:text-void-fg-3'
+											}
+											transition-colors duration-200
+										`}>
+											{messageCount}
+										</span>
+									)}
+								</button>
+								{/* Close button - only show if there's more than one tab */}
+								{allThreadIds.length > 1 && (
+									<button
+										onClick={(e) => handleCloseTab(e, threadId)}
+										className={`
+											ml-0.5 p-1 flex items-center justify-center
+											opacity-0 group-hover:opacity-100 transition-all duration-200
+											text-void-fg-4 hover:text-void-fg-1
+											hover:bg-void-bg-3/60 active:bg-void-bg-3/80
+											outline-none focus-visible:opacity-100 focus-visible:ring-1 focus-visible:ring-void-link-color/50
+										`}
+										aria-label={`Close ${title}`}
+										title={`Close ${title}`}
+										type='button'
+									>
+										<IconX size={11} className='stroke-[2.5]' />
+									</button>
+								)}
+							</div>
+						)
+					})}
+				</div>
+			</div>
+		)
+	}
 
 	return (
-		<Fragment key={threadId} // force rerender when change thread
+		<Fragment key={chatThreadsState.currentThreadId} // force rerender when change thread
 		>
-			{isLandingPage ?
-				landingPageContent
-				: threadPageContent}
+			<div className='w-full h-full flex flex-col overflow-hidden'>
+				{/* Tabs Bar - always visible when there are threads */}
+				{Object.keys(chatThreadsState.allThreads).length > 0 && (
+					<ErrorBoundary>
+						<ChatTabsBar />
+					</ErrorBoundary>
+				)}
+				{/* Content */}
+				<div className='flex-1 overflow-hidden'>
+					{isLandingPage ?
+						landingPageContent
+						: threadPageContent}
+				</div>
+			</div>
 		</Fragment>
 	)
 }
