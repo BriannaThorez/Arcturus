@@ -1404,7 +1404,7 @@ const LocalModelsPanel = () => {
 						<span className="text-void-fg-2">Models Installed</span>
 						<span className="text-void-fg-1">{ollamaModels.length}</span>
 					</div>
-					{systemCheck?.diskSpaceGb !== null && (
+					{systemCheck && systemCheck.diskSpaceGb !== null && (
 						<div className="flex items-center justify-between">
 							<span className="text-void-fg-2">Disk Space</span>
 							<span className="text-void-fg-1">{systemCheck.diskSpaceGb.toFixed(1)} GB</span>

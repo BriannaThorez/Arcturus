@@ -211,7 +211,8 @@ const newOpenAICompatibleSDK = async ({ settingsOfProvider, providerName, includ
 	// Use shorter timeout for local models (they're on localhost, should be fast)
 
 	// Detect local providers using centralized function
-	const isLocalProvider = checkIsLocalProvider(providerName, settingsOfProvider)
+	const endpoint = settingsOfProvider[providerName]?.endpoint || ''
+	const isLocalProvider = checkIsLocalProvider(providerName, endpoint)
 
 	// Optimize timeouts: local models should respond quickly, use aggressive timeouts
 	// Cloud models get more time for network latency
@@ -451,6 +452,14 @@ const sendOllamaFIM = ({ messages, onFinalMessage, onError, settingsOfProvider, 
 // This bypasses the OpenAI SDK wrapper and calls Ollama directly
 // Ollama now supports native tool calling (as of 2024), so we can use it for agent mode too!
 const sendOllamaChat = async ({ messages, onText, onFinalMessage, onError, settingsOfProvider, modelName, _setAborter, separateSystemMessage, overridesOfModel, chatMode, mcpTools }: SendChatParams_Internal): Promise<void> => {
+	// Wrap callbacks to extract XML tool calls if native tool calling doesn't work
+	// This handles models that output tool calls as XML in text instead of native format
+	let wrappedOnText = onText
+	let wrappedOnFinalMessage = onFinalMessage
+	const { newOnText, newOnFinalMessage } = extractXMLToolsWrapper(onText, onFinalMessage, chatMode, mcpTools)
+	wrappedOnText = newOnText
+	wrappedOnFinalMessage = newOnFinalMessage
+
 	const thisConfig = settingsOfProvider.ollama
 	console.debug('[sendOllamaChat] Using native Ollama SDK. Endpoint:', thisConfig.endpoint, 'Model:', modelName)
 	const ollama = getOllamaClient({ endpoint: thisConfig.endpoint })
@@ -619,16 +628,38 @@ const sendOllamaChat = async ({ messages, onText, onFinalMessage, onError, setti
 				if (toolCalls && toolCalls.length > 0) {
 					const toolCall = toolCalls[0] // Handle first tool call
 					if (toolCall.function) {
-						toolName += toolCall.function.name || ''
-						toolParamsStr += toolCall.function.arguments || ''
-						// Ollama's tool call may have id property, but it's optional in streaming
-						toolId += (toolCall as any).id || ''
+						const newName = toolCall.function.name || ''
+						// Handle arguments - could be string (streaming) or object (complete)
+						let newArgs = ''
+						const rawArgs = toolCall.function.arguments
+						if (typeof rawArgs === 'string') {
+							newArgs = rawArgs
+						} else if (typeof rawArgs === 'object' && rawArgs !== null) {
+							// If it's an object, stringify it
+							newArgs = JSON.stringify(rawArgs)
+						}
+						const newId = (toolCall as any).id || ''
+
+						if (newName && !toolName) {
+							// First time seeing this tool name
+							console.debug('[sendOllamaChat] Tool call detected:', newName, 'args type:', typeof rawArgs)
+						}
+
+						toolName += newName
+						toolParamsStr += newArgs
+						toolId += newId
+
+						// Log if we're accumulating params (help debug incomplete JSON)
+						if (newArgs && chunkCount % 5 === 0) {
+							console.debug('[sendOllamaChat] Accumulating tool params. Current length:', toolParamsStr.length, 'Last 50 chars:', toolParamsStr.substring(Math.max(0, toolParamsStr.length - 50)))
+						}
 					}
 				}
 
-				// Call onText immediately for streaming updates (no batching delay)
+				// Call wrappedOnText immediately for streaming updates (no batching delay)
+				// This will extract XML tool calls if native tool calling didn't work
 				if (newText || (toolCalls && toolCalls.length > 0)) {
-					onText({
+					wrappedOnText({
 						fullText: fullTextSoFar,
 						fullReasoning: '',
 						toolCall: !toolName ? undefined : { name: toolName, rawParams: {}, isDone: false, doneParams: [], id: toolId },
@@ -640,13 +671,39 @@ const sendOllamaChat = async ({ messages, onText, onFinalMessage, onError, setti
 					console.debug('[sendOllamaChat] First chunk structure:', JSON.stringify(chunk, null, 2))
 				}
 			}
-			console.debug('[sendOllamaChat] Stream completed. Total chunks:', chunkCount, 'Final text length:', fullTextSoFar.length, 'Tool call:', toolName || 'none')
+			console.debug('[sendOllamaChat] Stream completed. Total chunks:', chunkCount, 'Final text length:', fullTextSoFar.length, 'Tool call:', toolName || 'none', 'Tool params length:', toolParamsStr.length, 'Tool params preview:', toolParamsStr.substring(0, 200))
 
-			// Call onFinalMessage when stream completes
+			// Call wrappedOnFinalMessage when stream completes
 			if (fullTextSoFar || toolName) {
-				const toolCall = toolName ? rawToolCallObjOfParamsStr(toolName, toolParamsStr, toolId) : null
+				let toolCall = null
+				if (toolName) {
+					// Try to parse tool params
+					toolCall = rawToolCallObjOfParamsStr(toolName, toolParamsStr, toolId)
+					// If parsing failed but we have a tool name, try to handle it
+					if (!toolCall) {
+						// Check if toolParamsStr looks like it might be an object stringified incorrectly
+						console.warn('[sendOllamaChat] Failed to parse tool params. toolName:', toolName, 'toolParamsStr type:', typeof toolParamsStr, 'toolParamsStr:', toolParamsStr.substring(0, 200))
+
+						// If toolParamsStr is empty or just whitespace, create tool call with empty params
+						// This allows the tool execution loop to continue and the model can see the error
+						if (!toolParamsStr.trim()) {
+							console.warn('[sendOllamaChat] Tool params are empty, creating tool call with empty params')
+							toolCall = { id: toolId || `call_${Date.now()}`, name: toolName, rawParams: {}, doneParams: [], isDone: true }
+						} else {
+							// Try one more time with trimmed string
+							const trimmed = toolParamsStr.trim()
+							toolCall = rawToolCallObjOfParamsStr(toolName, trimmed, toolId)
+							if (!toolCall) {
+								console.warn('[sendOllamaChat] Still failed to parse after trim, creating tool call with empty params')
+								toolCall = { id: toolId || `call_${Date.now()}`, name: toolName, rawParams: {}, doneParams: [], isDone: true }
+							}
+						}
+					}
+				}
+
 				const toolCallObj = toolCall ? { toolCall } : {}
-				onFinalMessage({
+				// Use wrappedOnFinalMessage which will extract XML tool calls if present
+				wrappedOnFinalMessage({
 					fullText: fullTextSoFar,
 					fullReasoning: '',
 					anthropicReasoning: null,
@@ -758,8 +815,14 @@ function computeToolsetHash(chatMode: ChatMode | null, mcpTools: InternalToolInf
 }
 
 const openAITools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined) => {
-	const allowedTools = availableTools(chatMode, mcpTools)
-	if (!allowedTools || Object.keys(allowedTools).length === 0) return null
+	const allowedToolsArray = availableTools(chatMode, mcpTools)
+	if (!allowedToolsArray || allowedToolsArray.length === 0) return null
+
+	// Convert array to object keyed by tool name
+	const allowedTools: { [key: string]: InternalToolInfo } = {};
+	for (const tool of allowedToolsArray) {
+		allowedTools[tool.name] = tool;
+	}
 
 	// Part C: Check cache first
 	const hash = computeToolsetHash(chatMode, mcpTools, allowedTools);
@@ -767,6 +830,11 @@ const openAITools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | u
 	const cached = toolSchemaCacheMap.get(hash);
 
 	if (cached && (now - cached.timestamp) < TOOL_SCHEMA_CACHE_TTL) {
+		// Log cache hit in dev mode for verification
+		const isDev = typeof process !== 'undefined' && (process.env.NODE_ENV === 'development' || process.env.DEBUG);
+		if (isDev) {
+			console.debug(`[ToolSchemaCache] Cache HIT (hash: ${hash.substring(0, 8)}...)`);
+		}
 		return cached.openAIFormat;
 	}
 
@@ -821,7 +889,6 @@ const rawToolCallObjOfParamsStr = (name: string, toolParamsStr: string, id: stri
 	const rawParams: RawToolParamsObj = input
 	return { id, name, rawParams, doneParams: Object.keys(rawParams), isDone: true }
 }
-
 
 const rawToolCallObjOfAnthropicParams = (toolBlock: Anthropic.Messages.ToolUseBlock): RawToolCallObj | null => {
 	const { id, name, input } = toolBlock
@@ -1035,18 +1102,24 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		clearTimeout(timeoutId)
 		clearTimeout(firstTokenTimeoutId)
 
-		if (!fullTextSoFar && !fullReasoningSoFar && !toolName) {
+		// Trim whitespace to check if response is actually empty
+		const trimmedText = fullTextSoFar.trim();
+		const trimmedReasoning = fullReasoningSoFar.trim();
+
+		if (!trimmedText && !trimmedReasoning && !toolName) {
 			if (perfSpan) {
 				perfSpanTracker.completeSpan(perfSpan, false, 'EmptyResponse');
 			}
-			onError({ message: 'CortexIDE: Response from model was empty.', fullError: null })
+			console.warn('[sendLLMMessage] Local model returned empty response. fullTextSoFar length:', fullTextSoFar.length, 'fullReasoningSoFar length:', fullReasoningSoFar.length);
+			onError({ message: 'CortexIDE: Response from model was empty. The model may be overwhelmed by the context size. Try using a cloud model or reducing the codebase context.', fullError: null })
 		} else {
 			if (perfSpan) {
 				perfSpanTracker.completeSpan(perfSpan, true);
 			}
 			const toolCall = rawToolCallObjOfParamsStr(toolName, toolParamsStr, toolId)
 			const toolCallObj = toolCall ? { toolCall } : {}
-			onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, ...toolCallObj });
+			// Use trimmed versions to avoid sending whitespace-only responses
+			onFinalMessage({ fullText: trimmedText || fullTextSoFar, fullReasoning: trimmedReasoning || fullReasoningSoFar, anthropicReasoning: null, ...toolCallObj });
 		}
 	}
 
@@ -1552,8 +1625,14 @@ const toAnthropicTool = (toolInfo: InternalToolInfo) => {
 }
 
 const anthropicTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined) => {
-	const allowedTools = availableTools(chatMode, mcpTools)
-	if (!allowedTools || Object.keys(allowedTools).length === 0) return null
+	const allowedToolsArray = availableTools(chatMode, mcpTools)
+	if (!allowedToolsArray || allowedToolsArray.length === 0) return null
+
+	// Convert array to object keyed by tool name
+	const allowedTools: { [key: string]: InternalToolInfo } = {};
+	for (const tool of allowedToolsArray) {
+		allowedTools[tool.name] = tool;
+	}
 
 	const anthropicTools: Anthropic.Messages.ToolUnion[] = []
 	for (const t in allowedTools ?? {}) {
@@ -1777,8 +1856,15 @@ const toGeminiFunctionDecl = (toolInfo: InternalToolInfo) => {
 }
 
 const geminiTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined): GeminiTool[] | null => {
-	const allowedTools = availableTools(chatMode, mcpTools)
-	if (!allowedTools || Object.keys(allowedTools).length === 0) return null
+	const allowedToolsArray = availableTools(chatMode, mcpTools)
+	if (!allowedToolsArray || allowedToolsArray.length === 0) return null
+
+	// Convert array to object keyed by tool name
+	const allowedTools: { [key: string]: InternalToolInfo } = {};
+	for (const tool of allowedToolsArray) {
+		allowedTools[tool.name] = tool;
+	}
+
 	const functionDecls: FunctionDeclaration[] = []
 	for (const t in allowedTools ?? {}) {
 		functionDecls.push(toGeminiFunctionDecl(allowedTools[t]))

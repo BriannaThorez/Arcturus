@@ -302,14 +302,17 @@ export class TaskAwareModelRouter extends Disposable implements ITaskAwareModelR
 		let candidateModels = availableModels;
 
 		// For codebase questions: STRONGLY prefer online models - filter out local models if online models exist
+		// BUT: Respect localFirstAI setting - if enabled, don't filter out local models
 		// Detect codebase questions: complex reasoning + code task without code blocks, OR explicit context size requirement
 		const isCodebaseQuestionForFilter = (context.requiresComplexReasoning && context.taskType === 'code' && !context.hasCode) ||
 			(context.contextSize && context.contextSize > 15000) ||
 			(context.taskType === 'code' && context.isLongMessage && !context.hasCode);
 
-		if (isCodebaseQuestionForFilter && hasOnlineModels) {
+		if (isCodebaseQuestionForFilter && hasOnlineModels && !localFirstAI) {
 			// For codebase questions with online models available, ONLY consider online models
+			// UNLESS localFirstAI is enabled - then prefer local but allow cloud fallback
 			// This ensures we never select local models for codebase questions when better options exist
+			// (unless user explicitly wants local-first)
 			const beforeFilter = candidateModels.length;
 			candidateModels = candidateModels.filter(model => {
 				if (model.providerName === 'auto') return false;
@@ -319,7 +322,7 @@ export class TaskAwareModelRouter extends Disposable implements ITaskAwareModelR
 			const afterFilter = candidateModels.length;
 
 			// Debug logging
-			console.log('[ModelRouter] Filtering local models for codebase question:', {
+			console.log('[ModelRouter] Filtering local models for codebase question (localFirstAI disabled):', {
 				beforeFilter,
 				afterFilter,
 				filteredOut: beforeFilter - afterFilter,
@@ -334,6 +337,10 @@ export class TaskAwareModelRouter extends Disposable implements ITaskAwareModelR
 				});
 				candidateModels = availableModels; // Fallback to all models
 			}
+		} else if (isCodebaseQuestionForFilter && localFirstAI) {
+			// When localFirstAI is enabled, prefer local models but don't filter out cloud models
+			// The scoring will heavily favor local models, but cloud is still available as fallback
+			console.log('[ModelRouter] Local-First mode: Allowing local models for codebase question (will be heavily scored)');
 		}
 
 		// Filter by vision requirement
@@ -488,10 +495,18 @@ export class TaskAwareModelRouter extends Disposable implements ITaskAwareModelR
 
 		if (isCodebaseQuestionForDebug) {
 			const isLocal = (localProviderNames as readonly ProviderName[]).includes(finalModel.providerName as ProviderName);
-			if (isLocal && hasOnlineModels) {
-				console.warn('[ModelRouter] WARNING: Selected local model for codebase question despite online models available!', {
+			if (isLocal && hasOnlineModels && !localFirstAI) {
+				// Only warn if localFirstAI is NOT enabled - if it is, this is expected behavior
+				console.warn('[ModelRouter] WARNING: Selected local model for codebase question despite online models available (localFirstAI disabled)!', {
 					selectedModel: finalModel,
 					hasOnlineModels,
+					localFirstAI,
+					reasoning,
+					score: best.score,
+				});
+			} else if (isLocal && hasOnlineModels && localFirstAI) {
+				console.log('[ModelRouter] Selected local model for codebase question (localFirstAI enabled - expected behavior)', {
+					selectedModel: finalModel,
 					reasoning,
 					score: best.score,
 				});

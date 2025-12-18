@@ -10,7 +10,7 @@
  * to avoid rebuilding them on every request.
  */
 
-import type { ChatMode } from '../../contrib/chat/common/chatModes.js';
+import type { ChatMode } from '../common/cortexideSettingsTypes.js';
 import type { InternalToolInfo } from '../common/prompt/prompts.js';
 import type OpenAI from 'openai';
 

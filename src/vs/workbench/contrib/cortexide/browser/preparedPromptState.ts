@@ -10,10 +10,8 @@
  * This avoids expensive full message re-preparation on each tool turn.
  */
 
-import type { LLMChatMessage } from '../common/sendLLMMessageTypes.js';
-import type { SimpleLLMMessage } from './convertToLLMMessageService.js';
-import type { ModelSelection } from '../common/cortexideSettingsTypes.js';
-import type { ChatMode } from '../../contrib/chat/common/chatModes.js';
+import type { LLMChatMessage, OpenAILLMChatMessage } from '../common/sendLLMMessageTypes.js';
+import type { ModelSelection, ChatMode } from '../common/cortexideSettingsTypes.js';
 
 /**
  * Stable representation of tool schemas for caching
@@ -121,16 +119,18 @@ export class PreparedPromptState {
 				// Patch the existing assistant message with tool_calls
 				const existingMsg = messages[lastAssistantIdx];
 				if (existingMsg.role === 'assistant') {
-					// Merge tool_calls if present
-					if (bufferEntry.assistantMessage.tool_calls) {
-						existingMsg.tool_calls = bufferEntry.assistantMessage.tool_calls;
+					// Merge tool_calls if present (only for OpenAI format assistant messages)
+					const existingAssistant = existingMsg as Extract<OpenAILLMChatMessage, { role: 'assistant' }>;
+					if ('tool_calls' in existingAssistant && 'tool_calls' in bufferEntry.assistantMessage && bufferEntry.assistantMessage.tool_calls) {
+						existingAssistant.tool_calls = bufferEntry.assistantMessage.tool_calls;
 					}
 					// For Anthropic format, merge content arrays
 					if ('content' in bufferEntry.assistantMessage && Array.isArray(bufferEntry.assistantMessage.content)) {
 						if (Array.isArray(existingMsg.content)) {
-							existingMsg.content = [...existingMsg.content, ...bufferEntry.assistantMessage.content];
+							// Type assertion needed because tool_result types are valid in Anthropic format
+							(existingMsg as any).content = [...existingMsg.content, ...bufferEntry.assistantMessage.content];
 						} else {
-							existingMsg.content = bufferEntry.assistantMessage.content;
+							(existingMsg as any).content = bufferEntry.assistantMessage.content;
 						}
 					}
 				}
@@ -180,11 +180,10 @@ export class PreparedPromptState {
 		const systemMsg = messages.find(m => m.role === 'system');
 		const systemTokens = systemMsg ? this._estimateTokens(systemMsg) : 0;
 
-		// Find last user message
-		let lastUserIdx = -1;
+		// Find last user message (for potential future use in truncation strategy)
 		for (let i = messages.length - 1; i >= 0; i--) {
 			if (messages[i].role === 'user') {
-				lastUserIdx = i;
+				// lastUserIdx found but not used in current implementation
 				break;
 			}
 		}

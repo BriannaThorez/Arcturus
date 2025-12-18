@@ -14,6 +14,8 @@ import { CortexideCheckUpdateResponse } from './cortexideUpdateServiceTypes.js';
 export interface ICortexideUpdateService {
 	readonly _serviceBrand: undefined;
 	check: (explicit: boolean) => Promise<CortexideCheckUpdateResponse>;
+	setRemindLater: () => Promise<void>;
+	dismissVersion: (version: string) => Promise<void>;
 }
 
 
@@ -38,6 +40,14 @@ export class CortexideUpdateService implements ICortexideUpdateService {
 	check: ICortexideUpdateService['check'] = async (explicit) => {
 		const res = await this.cortexideUpdateService.check(explicit)
 		return res
+	}
+
+	setRemindLater: ICortexideUpdateService['setRemindLater'] = async () => {
+		await this.cortexideUpdateService.setRemindLater()
+	}
+
+	dismissVersion: ICortexideUpdateService['dismissVersion'] = async (version) => {
+		await this.cortexideUpdateService.dismissVersion(version)
 	}
 }
 

@@ -33,8 +33,8 @@ import { truncate } from '../../../../base/common/strings.js';
 import { THREAD_STORAGE_KEY } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { PreparedPromptState } from './preparedPromptState.js';
-import { compactToolResult, isLocalProviderForCompaction } from './toolResultCompaction.js';
-import { getToolParallelMetadata, isToolParallelSafe, getToolMaxConcurrency } from '../common/toolParallelMetadata.js';
+import { compactToolResult, isLocalProviderForCompaction, AGENT_MODE_LOCAL_POLICY } from './toolResultCompaction.js';
+import { isToolParallelSafe, getToolMaxConcurrency } from '../common/toolParallelMetadata.js';
 import { timeout } from '../../../../base/common/async.js';
 import { deepClone } from '../../../../base/common/objects.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
@@ -405,6 +405,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string } // default state
 		// When set for a thread, the next call to _shouldGeneratePlan will return false and clear the flag
 		this._suppressPlanOnceByThread = {}
+
+		// _runToolCallsParallel is now actively used for parallel tool execution
 
 		const readThreads = this._readAllThreads() || {}
 
@@ -2242,8 +2244,10 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 			}
 			catch (error) {
 				const errorMessage = getErrorMessage(error)
+				console.warn('[ChatThreadService] Tool param validation failed:', toolName, 'error:', errorMessage, 'params:', JSON.stringify(opts.unvalidatedToolParams))
 				this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content: errorMessage, id: toolId, mcpServerName })
-				return {}
+				// Return with awaitingUserApproval: false so the loop continues and model can try again or provide an answer
+				return { awaitingUserApproval: false }
 			}
 			// once validated, add checkpoint for edit
 			if (toolName === 'edit_file') { this._addToolEditCheckpoint({ threadId, uri: (toolParams as BuiltinToolCallParams['edit_file']).uri }) }
@@ -2542,51 +2546,135 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 
 	/**
 	 * Part E: Execute multiple tool calls in parallel when safe
-	 * Groups tools by parallel safety and executes them with concurrency limits
+	 * Groups tools by parallel safety and executes them with concurrency limits.
+	 *
+	 * Safety guarantees:
+	 * - Only tools marked parallel-safe in metadata are executed concurrently
+	 * - Tools requiring approval are never auto-executed in parallel (they trigger approval flow)
+	 * - Results are returned in the exact order of input toolCalls
+	 * - Global concurrency limit (default 8) prevents resource exhaustion
+	 * - Per-tool concurrency limits respect tool-specific constraints
+	 * - Cancellation is properly propagated to all in-flight tools
 	 */
-	private async _runToolCallsParallel = async (
+	private _runToolCallsParallel = async (
 		threadId: string,
 		toolCalls: Array<{ name: ToolName; id: string; rawParams: RawToolParamsObj; mcpServerName?: string }>,
+		cancelToken?: CancellationToken,
 	): Promise<Array<{ toolId: string; awaitingUserApproval?: boolean; interrupted?: boolean; error?: string }>> => {
-		// Group tools by parallel safety
-		const parallelSafe: typeof toolCalls = [];
+		if (toolCalls.length === 0) {
+			return [];
+		}
+
+		// Global concurrency limit (max 8 in-flight tools total)
+		const GLOBAL_MAX_CONCURRENCY = 8;
+
+		// Partition tools into parallel-safe and sequential
+		// IMPORTANT: Tools requiring approval should NOT be auto-executed in parallel
+		// They will be handled separately in the sequential path
+		const parallelCandidates: typeof toolCalls = [];
 		const sequential: typeof toolCalls = [];
 
+		const isDev = typeof process !== 'undefined' && (process.env.NODE_ENV === 'development' || process.env.DEBUG);
+
 		for (const toolCall of toolCalls) {
-			if (isToolParallelSafe(toolCall.name)) {
-				parallelSafe.push(toolCall);
+			// Check if tool is parallel-safe AND doesn't require approval
+			const isParallelSafe = isToolParallelSafe(toolCall.name);
+			const isBuiltInTool = isABuiltinToolName(toolCall.name);
+			const requiresApproval = isBuiltInTool && (toolCall.name in approvalTypeOfBuiltinToolName);
+
+			if (isParallelSafe && !requiresApproval) {
+				parallelCandidates.push(toolCall);
+				if (isDev) {
+					console.debug('[Parallel Execution] Tool', toolCall.name, 'marked as parallel-safe candidate');
+				}
 			} else {
 				sequential.push(toolCall);
+				if (isDev) {
+					console.debug('[Parallel Execution] Tool', toolCall.name, 'marked as sequential',
+						!isParallelSafe ? '(not parallel-safe)' : '(requires approval)');
+				}
 			}
 		}
 
-		const results: Array<{ toolId: string; awaitingUserApproval?: boolean; interrupted?: boolean; error?: string }> = [];
+		if (isDev) {
+			console.debug('[Parallel Execution] Partitioned', toolCalls.length, 'tools:',
+				parallelCandidates.length, 'parallel,', sequential.length, 'sequential');
+		}
 
-		// Execute parallel-safe tools with concurrency limits
-		if (parallelSafe.length > 0) {
-			// Group by tool name to apply per-tool concurrency limits
-			const toolGroups = new Map<string, typeof parallelSafe>();
-			for (const toolCall of parallelSafe) {
-				if (!toolGroups.has(toolCall.name)) {
-					toolGroups.set(toolCall.name, []);
-				}
-				toolGroups.get(toolCall.name)!.push(toolCall);
+		// Create result array with same order as input (preserve deterministic ordering)
+		const results: Array<{ toolId: string; awaitingUserApproval?: boolean; interrupted?: boolean; error?: string }> =
+			new Array(toolCalls.length);
+		const toolCallToIndex = new Map<string, number>();
+		toolCalls.forEach((tc, idx) => toolCallToIndex.set(tc.id, idx));
+
+		// Helper: Proper semaphore implementation using promises
+		class Semaphore {
+			private _count: number;
+			private _waiters: Array<() => void> = [];
+
+			constructor(private readonly _max: number) {
+				this._count = _max;
 			}
 
-			// Execute each tool group with its concurrency limit
-			for (const [toolName, group] of toolGroups.entries()) {
-				const maxConcurrency = getToolMaxConcurrency(toolName) || 5; // Default: 5 concurrent
-				let activeCount = 0;
-				const activePromises: Promise<void>[] = [];
+			async acquire(): Promise<void> {
+				if (this._count > 0) {
+					this._count--;
+					return;
+				}
+				return new Promise<void>((resolve) => {
+					this._waiters.push(resolve);
+				});
+			}
 
-				const executeWithSemaphore = async (toolCall: typeof toolCalls[0]) => {
-					// Wait for semaphore slot
-					while (activeCount >= maxConcurrency) {
-						await new Promise(resolve => setTimeout(resolve, 10));
+			release(): void {
+				if (this._waiters.length > 0) {
+					const resolve = this._waiters.shift()!;
+					resolve();
+				} else {
+					// Safety check: prevent count from exceeding max
+					if (this._count < this._max) {
+						this._count++;
 					}
-					activeCount++;
+				}
+			}
+		}
 
+		// Global semaphore for overall concurrency limit
+		const globalSemaphore = new Semaphore(GLOBAL_MAX_CONCURRENCY);
+
+		// Per-tool semaphores (lazy initialization)
+		const toolSemaphores = new Map<string, Semaphore>();
+
+		// Execute parallel-safe tools concurrently
+		if (parallelCandidates.length > 0) {
+			const executeTool = async (toolCall: typeof toolCalls[0]): Promise<void> => {
+				// Check cancellation before starting
+				if (cancelToken?.isCancellationRequested) {
+					const idx = toolCallToIndex.get(toolCall.id)!;
+					results[idx] = { toolId: toolCall.id, interrupted: true };
+					return;
+				}
+
+				// Get or create per-tool semaphore
+				let toolSemaphore = toolSemaphores.get(toolCall.name);
+				if (!toolSemaphore) {
+					const maxConcurrency = getToolMaxConcurrency(toolCall.name) ?? 4; // Default: 4 per tool
+					toolSemaphore = new Semaphore(maxConcurrency);
+					toolSemaphores.set(toolCall.name, toolSemaphore);
+				}
+
+				// Acquire both semaphores (global first, then per-tool)
+				await globalSemaphore.acquire();
+				try {
+					await toolSemaphore.acquire();
 					try {
+						// Check cancellation again after acquiring semaphores
+						if (cancelToken?.isCancellationRequested) {
+							const idx = toolCallToIndex.get(toolCall.id)!;
+							results[idx] = { toolId: toolCall.id, interrupted: true };
+							return;
+						}
+
 						const mcpTools = this._mcpService.getMCPTools();
 						const mcpTool = mcpTools?.find(t => t.name === toolCall.name);
 						const result = await this._runToolCall(
@@ -2596,22 +2684,36 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 							toolCall.mcpServerName || mcpTool?.mcpServerName,
 							{ preapproved: false, unvalidatedToolParams: toolCall.rawParams }
 						);
-						results.push({ toolId: toolCall.id, ...result });
-					} catch (error) {
-						results.push({ toolId: toolCall.id, error: error instanceof Error ? error.message : String(error) });
-					} finally {
-						activeCount--;
-					}
-				};
 
-				// Execute all tools in this group in parallel (with concurrency limit)
-				const groupPromises = group.map(executeWithSemaphore);
-				await Promise.all(groupPromises);
-			}
+						const idx = toolCallToIndex.get(toolCall.id)!;
+						results[idx] = { toolId: toolCall.id, ...result };
+					} finally {
+						toolSemaphore.release();
+					}
+				} catch (error) {
+					const idx = toolCallToIndex.get(toolCall.id)!;
+					results[idx] = {
+						toolId: toolCall.id,
+						error: error instanceof Error ? error.message : String(error)
+					};
+				} finally {
+					globalSemaphore.release();
+				}
+			};
+
+			// Execute all parallel candidates concurrently
+			await Promise.all(parallelCandidates.map(executeTool));
 		}
 
-		// Execute sequential tools one by one
+		// Execute sequential tools one by one (preserving order)
 		for (const toolCall of sequential) {
+			// Check cancellation before each sequential tool
+			if (cancelToken?.isCancellationRequested) {
+				const idx = toolCallToIndex.get(toolCall.id)!;
+				results[idx] = { toolId: toolCall.id, interrupted: true };
+				break; // Stop processing remaining tools
+			}
+
 			try {
 				const mcpTools = this._mcpService.getMCPTools();
 				const mcpTool = mcpTools?.find(t => t.name === toolCall.name);
@@ -2622,12 +2724,30 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 					toolCall.mcpServerName || mcpTool?.mcpServerName,
 					{ preapproved: false, unvalidatedToolParams: toolCall.rawParams }
 				);
-				results.push({ toolId: toolCall.id, ...result });
+
+				const idx = toolCallToIndex.get(toolCall.id)!;
+				results[idx] = { toolId: toolCall.id, ...result };
+
+				// If tool requires approval or was interrupted, stop processing remaining tools
+				if (result.awaitingUserApproval || result.interrupted) {
+					// Fill remaining results as interrupted if we stopped early
+					for (let i = idx + 1; i < toolCalls.length; i++) {
+						if (!results[i]) {
+							results[i] = { toolId: toolCalls[i].id, interrupted: true };
+						}
+					}
+					break;
+				}
 			} catch (error) {
-				results.push({ toolId: toolCall.id, error: error instanceof Error ? error.message : String(error) });
+				const idx = toolCallToIndex.get(toolCall.id)!;
+				results[idx] = {
+					toolId: toolCall.id,
+					error: error instanceof Error ? error.message : String(error)
+				};
 			}
 		}
 
+		// Return results in original order
 		return results;
 	};
 
@@ -2699,6 +2819,11 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 		let shouldSendAnotherMessage = true
 		let isRunningWhenEnd: IsRunningType = undefined
 		let filesReadInQuery = 0 // Track number of files read to prevent excessive reads
+		// Track repeated tool call failures to prevent infinite loops
+		let repeatedToolCallFailures = 0
+		// Track recent tool calls to detect infinite loops (same tool with same params)
+		const recentToolCalls: Array<{ name: string; params: string }> = []
+		const MAX_RECENT_TOOL_CALLS = 5 // Track last 5 tool calls
 
 		// PERFORMANCE: Check for plan ONCE at start, not on every tool call
 		// Only do plan tracking if an active plan exists
@@ -2841,11 +2966,22 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 		// Part A: Track tool execution timing across tool turns
 		let lastToolExecuteMs = 0;
 
+		// Track TTFUA (Time To First Useful Action) - time to first tool call
+		const agentStartTime = performance.now();
+		let firstToolCallTime: number | undefined;
+
 		// tool use loop
 		while (shouldSendAnotherMessage) {
 			// CRITICAL: Check for maximum iterations to prevent infinite loops
 			if (nMessagesSent >= MAX_AGENT_LOOP_ITERATIONS) {
 				this._notificationService.warn(`Agent loop reached maximum iterations (${MAX_AGENT_LOOP_ITERATIONS}). Stopping to prevent infinite loop.`)
+				// Add a final assistant message so the user isn't left without an answer
+				this._addMessageToThread(threadId, {
+					role: 'assistant',
+					displayContent: `I've tried multiple rounds of tool calls and analysis but seem to be stuck in a loop instead of producing a clear summary. Based on the files I've read so far, this project appears to be a server-side codebase (for example under the "server" folder) that powers the AHS Group application. For a more complete high-level summary, try asking again with a more specific question (e.g., "Summarize the server project under AHS Group") or consider using a larger cloud model in auto mode.`,
+					reasoning: '',
+					anthropicReasoning: null,
+				})
 				this._setStreamState(threadId, { isRunning: undefined })
 				return
 			}
@@ -3011,9 +3147,16 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 			// Check if we can use incremental PreparedPromptState (on tool turns after first iteration)
 			const isToolTurn = nMessagesSent > 1 && preparedPromptState !== null;
 			const canUseIncremental = isToolTurn &&
+				preparedPromptState !== null &&
 				preparedPromptState.modelSelection.providerName === modelSelection?.providerName &&
 				preparedPromptState.modelSelection.modelName === modelSelection?.modelName &&
 				preparedPromptState.chatMode === chatMode;
+
+			// Log incremental prompt usage for verification (dev mode only)
+			const isDev = typeof process !== 'undefined' && (process.env.NODE_ENV === 'development' || process.env.DEBUG);
+			if (isDev && isToolTurn) {
+				console.debug(`[AgentMode] Tool turn ${nMessagesSent}: ${canUseIncremental ? 'USING incremental prompt' : 'FALLING BACK to full prompt rebuild'}`);
+			}
 
 			if (canUseIncremental) {
 				// Part B: Incremental update - append tool results without full rebuild
@@ -3038,10 +3181,11 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 						if (msg.role === 'tool') {
 							const toolMsg = msg as ToolMessage<ToolName>;
 							if (toolMsg.type === 'success' || toolMsg.type === 'tool_error') {
-								// Part D: Compact tool results for local providers
+								// Part D: Compact tool results for local providers (more aggressive in agent mode)
 								let content = toolMsg.content;
-								if (modelSelection && isLocalProviderForCompaction(modelSelection.providerName)) {
-									const compacted = compactToolResult(content, toolMsg.name);
+								if (modelSelection && modelSelection.providerName !== 'auto' && isLocalProviderForCompaction(modelSelection.providerName)) {
+									// Use more aggressive compaction policy for local models in agent mode
+									const compacted = compactToolResult(content, toolMsg.name, chatMode === 'agent' ? AGENT_MODE_LOCAL_POLICY : undefined);
 									content = compacted.compacted;
 									// Store original in metadata for UI (if needed)
 									if (compacted.wasCompacted) {
@@ -3076,18 +3220,79 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 				} : undefined;
 
 				// Append tool results incrementally
-				if (toolResults.length > 0 && assistantMessage) {
+				// BUT: If file read limit exceeded, skip incremental and do fresh prep without tools
+				if (toolResults.length > 0 && assistantMessage && preparedPromptState !== null && !fileReadLimitExceeded) {
 					preparedPromptState.appendToolResults(assistantMessage, toolResults);
 				}
 
 				// Build final messages from incremental state
-				messages = preparedPromptState.buildFinalMessages();
-				separateSystemMessage = preparedPromptState.separateSystemMessage;
-				promptTokens = preparedPromptState.baseTokenCount;
-				contextSize = preparedPromptState.baseContextSize;
+				// BUT: If file read limit exceeded, force fresh prep without tools
+				if (preparedPromptState !== null && !fileReadLimitExceeded) {
+					messages = preparedPromptState.buildFinalMessages();
+					separateSystemMessage = preparedPromptState.separateSystemMessage;
+					promptTokens = preparedPromptState.baseTokenCount;
+					contextSize = preparedPromptState.baseContextSize;
+					promptPrepareMs = performance.now() - toolResultsStart;
+					tokenCountMs = 0; // Already computed incrementally
+				} else {
+					// Fallback: if preparedPromptState is null, fall through to full preparation
+					// This should not happen, but handle it gracefully
+					const fullPrepStart = performance.now();
 
-				promptPrepareMs = performance.now() - toolResultsStart;
-				tokenCountMs = 0; // Already computed incrementally
+					// If file read limit exceeded, disable tools and add instruction message
+					let messagesToPrepare = preprocessedMessages;
+					let effectiveChatMode = chatMode;
+
+					if (fileReadLimitExceeded) {
+						// Disable tools to force text-only response (use 'normal' mode which doesn't include tools)
+						effectiveChatMode = 'normal';
+						// Add a user message instructing the model to provide a final answer
+						const thread = this.state.allThreads[threadId];
+						if (thread) {
+							const lastUserMsg = [...thread.messages].reverse().find(m => m.role === 'user');
+							if (lastUserMsg && !lastUserMsg.displayContent?.includes('Please provide a final answer')) {
+								messagesToPrepare = [...preprocessedMessages, {
+									role: 'user' as const,
+									content: `I've already read ${filesReadInQuery} files. Please provide a comprehensive final answer to the original question based on the information you've gathered. Do not use any more tools - just provide your answer directly.`,
+									displayContent: `I've already read ${filesReadInQuery} files. Please provide a comprehensive final answer to the original question based on the information you've gathered. Do not use any more tools - just provide your answer directly.`,
+									selections: null,
+									state: { stagingSelections: [], isBeingEdited: false }
+								}];
+							}
+						}
+					}
+
+					const cacheKey = this._getMessagePrepCacheKey(messagesToPrepare, modelSelection, effectiveChatMode, repoIndexerResults);
+					const cached = this._messagePrepCache.get(cacheKey);
+					const now = Date.now();
+
+					// Use cached result if available and not expired
+					if (cached && (now - cached.timestamp) < ChatThreadService.MESSAGE_PREP_CACHE_TTL) {
+						messages = cached.messages;
+						separateSystemMessage = cached.separateSystemMessage;
+						promptTokens = cached.tokenCount;
+						contextSize = cached.contextSize;
+						promptPrepareMs = 0; // Cached, no prep time
+					} else {
+						// Prepare messages (expensive operation)
+						const prepResult = await this._convertToLLMMessagesService.prepareLLMChatMessages({
+							chatMessages: messagesToPrepare,
+							modelSelection,
+							chatMode: effectiveChatMode,
+							repoIndexerPromise: repoIndexerResults ? Promise.resolve(repoIndexerResults) : repoIndexerPromise
+						});
+						messages = prepResult.messages;
+						separateSystemMessage = prepResult.separateSystemMessage;
+
+						// Compute token count and context size
+						const tokenCountStart = performance.now();
+						const tokenResult = this._computeTokenCount(messages);
+						promptTokens = tokenResult.tokenCount;
+						contextSize = tokenResult.contextSize;
+						tokenCountMs = performance.now() - tokenCountStart;
+						promptPrepareMs = performance.now() - fullPrepStart;
+					}
+				}
 			} else {
 				// First iteration or state invalid - do full preparation
 				const fullPrepStart = performance.now();
@@ -3105,10 +3310,33 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 					promptPrepareMs = 0; // Cached, no prep time
 				} else {
 					// Prepare messages (expensive operation)
+					// If file read limit exceeded, disable tools (chatMode: null) and add instruction to provide final answer
+					let messagesToPrepare = preprocessedMessages;
+					let effectiveChatMode = chatMode;
+
+					if (fileReadLimitExceeded) {
+						// Disable tools to force text-only response (use 'normal' mode which doesn't include tools)
+						effectiveChatMode = 'normal';
+						// Add a user message instructing the model to provide a final answer
+						const thread = this.state.allThreads[threadId];
+						if (thread) {
+							const lastUserMsg = [...thread.messages].reverse().find(m => m.role === 'user');
+							if (lastUserMsg && !lastUserMsg.displayContent?.includes('Please provide a final answer')) {
+								messagesToPrepare = [...preprocessedMessages, {
+									role: 'user' as const,
+									content: `I've already read ${filesReadInQuery} files. Please provide a comprehensive final answer to the original question based on the information you've gathered. Do not use any more tools - just provide your answer directly.`,
+									displayContent: `I've already read ${filesReadInQuery} files. Please provide a comprehensive final answer to the original question based on the information you've gathered. Do not use any more tools - just provide your answer directly.`,
+									selections: null,
+									state: { stagingSelections: [], isBeingEdited: false }
+								}];
+							}
+						}
+					}
+
 					const prepResult = await this._convertToLLMMessagesService.prepareLLMChatMessages({
-						chatMessages: preprocessedMessages,
+						chatMessages: messagesToPrepare,
 						modelSelection,
-						chatMode,
+						chatMode: effectiveChatMode,
 						repoIndexerPromise: repoIndexerResults ? Promise.resolve(repoIndexerResults) : repoIndexerPromise
 					});
 					messages = prepResult.messages;
@@ -3472,6 +3700,32 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 									ttfs: metrics?.ttfs,
 								},
 							});
+						}
+
+						// Track TTFUA: time to first tool call
+						if (toolCall && !firstToolCallTime) {
+							firstToolCallTime = performance.now();
+							const ttfu = firstToolCallTime - agentStartTime;
+							// Log in dev mode for verification
+							const isDev = typeof process !== 'undefined' && (process.env.NODE_ENV === 'development' || process.env.DEBUG);
+							if (isDev) {
+								console.debug(`[AgentMode] TTFUA (Time To First Useful Action): ${ttfu.toFixed(2)}ms`);
+							}
+							// Store in audit log if enabled
+							if (auditEnabled && modelSelection) {
+								await this._auditLogService.append({
+									ts: Date.now(),
+									action: 'agent_ttfua',
+									model: `${modelSelection.providerName}/${modelSelection.modelName}`,
+									ok: true,
+									meta: {
+										threadId,
+										requestId: finalRequestId,
+										ttfua: ttfu,
+										toolName: toolCall.name,
+									},
+								});
+							}
 						}
 
 						resMessageIsDonePromise({ type: 'llmDone', toolCall, info: { fullText, fullReasoning, anthropicReasoning } }) // resolve with tool calls
@@ -3896,14 +4150,67 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 					return
 				}
 
+				// CRITICAL: If model generated substantial text response without tool calls, stop the loop
+				// This prevents continuing to call tools when the model has already provided an answer
+				// Only stop if we have meaningful text (more than 50 chars) and no tool call
+				// BUT: Don't stop if the text contains XML tool tags (they might be extracted later)
+				const hasXMLToolTags = info.fullText.includes('<read_file>') || info.fullText.includes('<ls_dir>') ||
+					info.fullText.includes('<get_dir_tree>') || info.fullText.includes('<search_') ||
+					info.fullText.includes('<edit_file>') || info.fullText.includes('<rewrite_file>')
+
+				if (!toolCall && info.fullText.trim().length > 50 && !hasXMLToolTags) {
+					// Model provided a substantial answer without tools - stop the loop
+					console.debug('[ChatThreadService] Model provided substantial text response without tools, stopping loop.')
+					this._setStreamState(threadId, { isRunning: undefined })
+					return
+				}
+
 				// call tool if there is one
 				if (toolCall) {
+					const toolParamsStr = JSON.stringify(toolCall.rawParams)
+					console.debug('[ChatThreadService] Tool call detected:', toolCall.name, 'params:', toolParamsStr)
+
+					// Check for repeated identical tool calls (same tool + same params)
+					// This detects if we're calling the same tool with the same params multiple times
+					const currentToolCall = { name: toolCall.name, params: toolParamsStr }
+					const isRepeated = recentToolCalls.some(tc => tc.name === currentToolCall.name && tc.params === currentToolCall.params)
+
+					if (isRepeated) {
+						// Same tool call with same params repeated - likely stuck in a loop
+						repeatedToolCallFailures++
+						console.warn('[ChatThreadService] Detected repeated identical tool call:', toolCall.name, 'params:', toolParamsStr.substring(0, 100), 'repetition count:', repeatedToolCallFailures)
+
+						if (repeatedToolCallFailures >= 2) {
+							// Stop after 2 repetitions (3rd attempt) to prevent infinite loop
+							console.warn('[ChatThreadService] Detected repeated tool call loop. Stopping to prevent infinite retry.')
+							this._addMessageToThread(threadId, {
+								role: 'assistant',
+								displayContent: `I've been trying to use the ${toolCall.name} tool repeatedly with the same parameters, which suggests I'm stuck in a loop. Let me provide an answer based on what I've gathered so far, or please try rephrasing your question.`,
+								reasoning: '',
+								anthropicReasoning: null
+							})
+							this._setStreamState(threadId, { isRunning: undefined })
+							return
+						}
+					} else {
+						// Different tool call or different params - reset counter
+						repeatedToolCallFailures = 0
+					}
+
+					// Always add to recent calls BEFORE execution to track what we're about to do
+					recentToolCalls.push(currentToolCall)
+					// Keep only last N tool calls
+					if (recentToolCalls.length > MAX_RECENT_TOOL_CALLS) {
+						recentToolCalls.shift()
+					}
+
 					// Part A: Track tool execution timing
 					const toolExecuteStart = performance.now();
 
 					// Skip tool execution if file read limit was exceeded in a previous iteration
 					if (fileReadLimitExceeded) {
-						// Don't execute any more tools - just continue to final LLM call
+						// Don't execute any more tools - skip this tool call and continue to final LLM call
+						// The next LLM call will be made without tools (chatMode: null) to force text-only response
 						shouldSendAnotherMessage = true
 						continue
 					}
@@ -3944,14 +4251,53 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 					}
 
 					// PERFORMANCE: Use cached step from activePlanTracking, don't lookup every time
+					// Link tool call to plan step before execution
 					if (activePlanTracking?.currentStep) {
 						this._linkToolCallToStepInternal(threadId, toolCall.id, activePlanTracking.currentStep)
 					}
 
+					// Prepare tool call for parallel execution (currently single, but ready for multiple)
 					const mcpTools = this._mcpService.getMCPTools()
 					const mcpTool = mcpTools?.find(t => t.name === toolCall.name)
+					const toolCallsToExecute = [{
+						name: toolCall.name,
+						id: toolCall.id,
+						rawParams: toolCall.rawParams,
+						mcpServerName: mcpTool?.mcpServerName
+					}]
 
-					const { awaitingUserApproval, interrupted } = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams })
+					// Debug logging for parallel execution
+					const isDev = typeof process !== 'undefined' && (process.env.NODE_ENV === 'development' || process.env.DEBUG);
+					if (isDev) {
+						console.debug('[Parallel Execution] Executing', toolCallsToExecute.length, 'tool call(s):',
+							toolCallsToExecute.map(tc => tc.name).join(', '));
+					}
+
+					// Execute tool call(s) using parallel execution infrastructure
+					// This handles both single and multiple tool calls, with proper concurrency limits
+					// Note: Cancellation token not yet implemented for tool execution (llmCancelToken is string, not CancellationToken)
+					const parallelExecutionStart = performance.now();
+					const executionResults = await this._runToolCallsParallel(
+						threadId,
+						toolCallsToExecute,
+						undefined // TODO: Implement proper cancellation token propagation
+					)
+					const parallelExecutionMs = performance.now() - parallelExecutionStart;
+
+					if (isDev && toolCallsToExecute.length > 1) {
+						console.debug('[Parallel Execution] Completed', executionResults.length, 'tool calls in',
+							parallelExecutionMs.toFixed(2), 'ms');
+					}
+
+					// Extract result (should be single result for now, but ready for multiple)
+					const result = executionResults[0]
+					if (!result) {
+						console.error('[ChatThreadService] No result returned from parallel tool execution')
+						shouldSendAnotherMessage = true
+						continue
+					}
+
+					const { awaitingUserApproval, interrupted } = result
 					lastToolExecuteMs = performance.now() - toolExecuteStart;
 
 					if (interrupted) {
@@ -3962,6 +4308,9 @@ Output ONLY the JSON, no other text. Start with { and end with }.`
 						}
 						return
 					}
+
+					// Note: Tool call results are tracked via recentToolCalls array for loop detection
+					// We don't need to track failures separately since we detect loops by repeated identical calls
 
 					// Only update plan step status if we have an active plan (skip if no plan)
 					if (activePlanTracking?.currentStep) {

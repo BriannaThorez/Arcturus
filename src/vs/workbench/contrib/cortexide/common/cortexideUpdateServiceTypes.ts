@@ -4,11 +4,13 @@
  *--------------------------------------------------------------------------------------*/
 
 export type CortexideCheckUpdateResponse = {
-	message: string,
-	action?: 'reinstall' | 'restart' | 'download' | 'apply'
+	message: string;
+	action?: 'reinstall' | 'restart' | 'download' | 'apply';
+	version?: string;
+	releaseNotes?: string;
 } | {
-	message: null,
-	actions?: undefined,
-} | null
+	message: null;
+	actions?: undefined;
+} | null;
 
 

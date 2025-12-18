@@ -320,7 +320,47 @@ export const extractXMLToolsWrapper = (
 					fullText = fullText.substring(0, idx)
 				}
 
+				// Also check for JSON tool calls in the text (fallback for models that output JSON instead of XML)
+				// Only check if we haven't found an XML tag yet
+				if (foundOpenTag === null && fullText) {
+					const jsonPattern = /\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[\s\S]*?\})\s*\}/;
+					const match = fullText.match(jsonPattern);
+					if (match) {
+						const toolName = match[1];
+						const argumentsStr = match[2];
 
+						// Check if this is a valid tool name (built-in or MCP)
+						const isValidTool = tools.some(t => t.name === toolName) ||
+							(mcpTools && mcpTools.some(t => t.name === toolName));
+
+						if (isValidTool) {
+							try {
+								const argumentsObj = JSON.parse(argumentsStr);
+								// Convert JSON arguments to XML-like format for parsing
+								let xmlStr = `<${toolName}>`;
+								for (const [key, value] of Object.entries(argumentsObj)) {
+									xmlStr += `<${key}>${typeof value === 'string' ? value : JSON.stringify(value)}</${key}>`;
+								}
+								xmlStr += `</${toolName}>`;
+
+								// Parse using the XML parser
+								const jsonToolCall = parseXMLPrefixToToolCall(
+									toolName as ToolName,
+									generateUuid(),
+									xmlStr,
+									toolOfToolName,
+								);
+								if (jsonToolCall && jsonToolCall.isDone) {
+									// Remove the JSON tool call from the text immediately (like we do for XML tags)
+									fullText = fullText.replace(jsonPattern, '').trim();
+									latestToolCall = jsonToolCall;
+								}
+							} catch (e) {
+								// Failed to parse JSON, ignore - might be incomplete
+							}
+						}
+					}
+				}
 			}
 		}
 
@@ -347,7 +387,51 @@ export const extractXMLToolsWrapper = (
 		newOnText({ ...params })
 
 		fullText = fullText.trimEnd()
-		const toolCall = latestToolCall
+		let toolCall = latestToolCall
+
+		// Fallback: If XML extraction didn't find a tool call, try JSON extraction
+		// This handles models that output tool calls as JSON in text instead of XML
+		if (!toolCall && fullText) {
+			// Check if there's a JSON tool call pattern in the text
+			const jsonPattern = /\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[\s\S]*?\})\s*\}/;
+			const match = fullText.match(jsonPattern);
+
+			if (match) {
+				const toolName = match[1];
+				const argumentsStr = match[2];
+
+				// Check if this is a valid tool name (built-in or MCP)
+				const isValidTool = tools.some(t => t.name === toolName) ||
+					(mcpTools && mcpTools.some(t => t.name === toolName));
+
+				if (isValidTool) {
+					try {
+						const argumentsObj = JSON.parse(argumentsStr);
+						// Convert JSON arguments to XML-like format for parsing
+						// Create a temporary XML string with the tool name and arguments as XML tags
+						let xmlStr = `<${toolName}>`;
+						for (const [key, value] of Object.entries(argumentsObj)) {
+							xmlStr += `<${key}>${typeof value === 'string' ? value : JSON.stringify(value)}</${key}>`;
+						}
+						xmlStr += `</${toolName}>`;
+
+						// Parse using the XML parser
+						toolCall = parseXMLPrefixToToolCall(
+							toolName as ToolName,
+							generateUuid(),
+							xmlStr,
+							toolOfToolName,
+						);
+						if (toolCall && toolCall.isDone) {
+							// Remove the JSON tool call from the text
+							fullText = fullText.replace(jsonPattern, '').trim();
+						}
+					} catch (e) {
+						// Failed to parse JSON, ignore
+					}
+				}
+			}
+		}
 
 		// console.log('final message!!!', trueFullText)
 		// console.log('----- returning ----\n', fullText)

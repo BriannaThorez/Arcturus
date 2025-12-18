@@ -5,7 +5,7 @@
 
 import { useEffect, useState } from 'react';
 import { useAccessor } from '../util/services.js';
-import { Check, X, Loader2, AlertCircle, ChevronRight } from 'lucide-react';
+import { Check, X, Loader2, AlertCircle, ChevronRight, ChevronLeft } from 'lucide-react';
 import { ModelPackType, LocalSetupState } from '../../../../common/localSetupServiceTypes.js';
 import { getAllModelPacks } from '../../../../common/modelPacks.js';
 import ErrorBoundary from '../sidebar-tsx/ErrorBoundary.js';
@@ -101,7 +101,37 @@ export const LocalSetupWizard = ({ onComplete, onSkip }: LocalSetupWizardProps) 
 		onSkip();
 	};
 
+	const handleBack = () => {
+		// Don't allow going back during active operations
+		if (state.type === 'downloading' || state.type === 'verifying') {
+			return;
+		}
+
+		if (step === 0) {
+			// Go back to main onboarding
+			onSkip();
+		} else if (step === 1) {
+			// Go back to choice step
+			setStep(0);
+			setSystemCheck(null);
+		} else if (step === 2) {
+			// Go back to system check
+			setStep(1);
+		} else if (step === 3) {
+			// Go back to model pack selection
+			setStep(2);
+		} else if (step === 4) {
+			// Go back to verification
+			setStep(3);
+			setVerificationResults(null);
+		} else if (step === 5) {
+			// Go back to verification results
+			setStep(4);
+		}
+	};
+
 	const progress = localSetupService.getProgress();
+	const canGoBack = step > 0 && state.type !== 'downloading' && state.type !== 'verifying';
 
 	return (
 		<ErrorBoundary>
@@ -129,21 +159,30 @@ export const LocalSetupWizard = ({ onComplete, onSkip }: LocalSetupWizardProps) 
 
 				{/* Step Content */}
 				<div className="rounded-[32px] border border-void-border-3 bg-void-bg-2/70 backdrop-blur-xl shadow-[0_45px_120px_rgba(0,0,0,0.45)] p-8">
-					{step === 0 && <ChoiceStep onChoice={handleChoice} />}
-					{step === 1 && systemCheck && <SystemCheckStep systemCheck={systemCheck} onInstall={handleInstallOllama} onNext={() => setStep(2)} />}
-					{step === 2 && <ModelPackStep selectedPack={selectedPack} onSelect={handleSelectPack} onDownload={handleDownloadModels} state={state} />}
-					{step === 3 && <VerificationStep onVerify={handleVerify} state={state} />}
-					{step === 4 && verificationResults && <VerificationResultsStep results={verificationResults} onNext={handleSetDefaults} />}
-					{step === 5 && <DefaultsStep onComplete={onComplete} />}
+					{step === 0 && <ChoiceStep onChoice={handleChoice} onBack={onSkip} />}
+					{step === 1 && systemCheck && <SystemCheckStep systemCheck={systemCheck} onInstall={handleInstallOllama} onNext={() => setStep(2)} onBack={handleBack} canGoBack={canGoBack} />}
+					{step === 2 && <ModelPackStep selectedPack={selectedPack} onSelect={handleSelectPack} onDownload={handleDownloadModels} state={state} onBack={handleBack} canGoBack={canGoBack} />}
+					{step === 3 && <VerificationStep onVerify={handleVerify} state={state} onBack={handleBack} canGoBack={canGoBack} />}
+					{step === 4 && verificationResults && <VerificationResultsStep results={verificationResults} onNext={handleSetDefaults} onBack={handleBack} canGoBack={canGoBack} />}
+					{step === 5 && <DefaultsStep onComplete={onComplete} onBack={handleBack} canGoBack={canGoBack} />}
 				</div>
 			</div>
 		</ErrorBoundary>
 	);
 };
 
-const ChoiceStep = ({ onChoice }: { onChoice: (choice: 'local' | 'cloud' | 'later') => void }) => {
+const ChoiceStep = ({ onChoice, onBack }: { onChoice: (choice: 'local' | 'cloud' | 'later') => void; onBack: () => void }) => {
 	return (
 		<div className="space-y-6">
+			<div className="flex items-center gap-4 mb-4">
+				<button
+					onClick={onBack}
+					className="flex items-center gap-2 px-4 py-2 rounded-xl border border-void-border-3 bg-void-bg-3/40 text-void-fg-3 hover:text-void-fg-1 hover:border-void-border-2 transition-all"
+				>
+					<ChevronLeft className="w-4 h-4" />
+					Back
+				</button>
+			</div>
 			<div className="text-center space-y-4">
 				<h2 className="text-4xl font-light text-void-fg-0">Choose your setup</h2>
 				<p className="text-void-fg-3 max-w-2xl mx-auto">
@@ -189,7 +228,7 @@ const ChoiceStep = ({ onChoice }: { onChoice: (choice: 'local' | 'cloud' | 'late
 	);
 };
 
-const SystemCheckStep = ({ systemCheck, onInstall, onNext }: { systemCheck: any; onInstall: () => void; onNext: () => void }) => {
+const SystemCheckStep = ({ systemCheck, onInstall, onNext, onBack, canGoBack }: { systemCheck: any; onInstall: () => void; onNext: () => void; onBack: () => void; canGoBack: boolean }) => {
 	return (
 		<div className="space-y-6">
 			<h2 className="text-3xl font-light text-void-fg-0 mb-4">System Check</h2>
@@ -212,6 +251,15 @@ const SystemCheckStep = ({ systemCheck, onInstall, onNext }: { systemCheck: any;
 			</div>
 
 			<div className="flex gap-4 mt-8">
+				{canGoBack && (
+					<button
+						onClick={onBack}
+						className="flex items-center gap-2 px-5 py-3 rounded-2xl border border-void-border-3 bg-void-bg-3/40 text-void-fg-3 hover:text-void-fg-1 hover:border-void-border-2 transition-all"
+					>
+						<ChevronLeft className="w-4 h-4" />
+						Back
+					</button>
+				)}
 				{!systemCheck.ollamaInstalled && (
 					<button
 						onClick={onInstall}
@@ -244,12 +292,23 @@ const CheckItem = ({ label, status }: { label: string; status: 'pass' | 'fail' |
 	);
 };
 
-const ModelPackStep = ({ selectedPack, onSelect, onDownload, state }: { selectedPack: ModelPackType; onSelect: (pack: ModelPackType) => void; onDownload: () => void; state: LocalSetupState }) => {
+const ModelPackStep = ({ selectedPack, onSelect, onDownload, state, onBack, canGoBack }: { selectedPack: ModelPackType; onSelect: (pack: ModelPackType) => void; onDownload: () => void; state: LocalSetupState; onBack: () => void; canGoBack: boolean }) => {
 	const packs = getAllModelPacks();
 	const isDownloading = state.type === 'downloading';
 
 	return (
 		<div className="space-y-6">
+			<div className="flex items-center gap-4 mb-4">
+				{canGoBack && (
+					<button
+						onClick={onBack}
+						className="flex items-center gap-2 px-4 py-2 rounded-xl border border-void-border-3 bg-void-bg-3/40 text-void-fg-3 hover:text-void-fg-1 hover:border-void-border-2 transition-all"
+					>
+						<ChevronLeft className="w-4 h-4" />
+						Back
+					</button>
+				)}
+			</div>
 			<h2 className="text-3xl font-light text-void-fg-0 mb-4">Choose a model pack</h2>
 			<p className="text-void-fg-3 mb-6">Select a pre-configured set of models optimized for different use cases.</p>
 
@@ -302,22 +361,46 @@ const ModelPackStep = ({ selectedPack, onSelect, onDownload, state }: { selected
 				</div>
 			)}
 
-			<button
-				onClick={onDownload}
-				disabled={isDownloading}
-				className="w-full mt-6 px-6 py-3 rounded-2xl bg-gradient-to-r from-[#0e70c0] to-[#6b5bff] text-white font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-			>
-				{isDownloading ? 'Downloading...' : 'Download Models'}
-			</button>
+			<div className="flex gap-4 mt-6">
+				{canGoBack && (
+					<button
+						onClick={onBack}
+						disabled={isDownloading}
+						className="flex items-center gap-2 px-5 py-3 rounded-2xl border border-void-border-3 bg-void-bg-3/40 text-void-fg-3 hover:text-void-fg-1 hover:border-void-border-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+					>
+						<ChevronLeft className="w-4 h-4" />
+						Back
+					</button>
+				)}
+				<button
+					onClick={onDownload}
+					disabled={isDownloading}
+					className="flex-1 px-6 py-3 rounded-2xl bg-gradient-to-r from-[#0e70c0] to-[#6b5bff] text-white font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+				>
+					{isDownloading ? 'Downloading...' : 'Download Models'}
+				</button>
+			</div>
 		</div>
 	);
 };
 
-const VerificationStep = ({ onVerify, state }: { onVerify: () => void; state: LocalSetupState }) => {
+const VerificationStep = ({ onVerify, state, onBack, canGoBack }: { onVerify: () => void; state: LocalSetupState; onBack: () => void; canGoBack: boolean }) => {
 	const isVerifying = state.type === 'verifying';
 
 	return (
 		<div className="space-y-6">
+			<div className="flex items-center gap-4 mb-4">
+				{canGoBack && (
+					<button
+						onClick={onBack}
+						disabled={isVerifying}
+						className="flex items-center gap-2 px-4 py-2 rounded-xl border border-void-border-3 bg-void-bg-3/40 text-void-fg-3 hover:text-void-fg-1 hover:border-void-border-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+					>
+						<ChevronLeft className="w-4 h-4" />
+						Back
+					</button>
+				)}
+			</div>
 			<h2 className="text-3xl font-light text-void-fg-0 mb-4">Verifying Capabilities</h2>
 			<p className="text-void-fg-3 mb-6">Testing that your local models work correctly.</p>
 
@@ -333,20 +416,42 @@ const VerificationStep = ({ onVerify, state }: { onVerify: () => void; state: Lo
 			)}
 
 			{!isVerifying && (
-				<button
-					onClick={onVerify}
-					className="w-full mt-6 px-6 py-3 rounded-2xl bg-gradient-to-r from-[#0e70c0] to-[#6b5bff] text-white font-medium"
-				>
-					Run Verification
-				</button>
+				<div className="flex gap-4 mt-6">
+					{canGoBack && (
+						<button
+							onClick={onBack}
+							className="flex items-center gap-2 px-5 py-3 rounded-2xl border border-void-border-3 bg-void-bg-3/40 text-void-fg-3 hover:text-void-fg-1 hover:border-void-border-2 transition-all"
+						>
+							<ChevronLeft className="w-4 h-4" />
+							Back
+						</button>
+					)}
+					<button
+						onClick={onVerify}
+						className="flex-1 px-6 py-3 rounded-2xl bg-gradient-to-r from-[#0e70c0] to-[#6b5bff] text-white font-medium"
+					>
+						Run Verification
+					</button>
+				</div>
 			)}
 		</div>
 	);
 };
 
-const VerificationResultsStep = ({ results, onNext }: { results: any; onNext: () => void }) => {
+const VerificationResultsStep = ({ results, onNext, onBack, canGoBack }: { results: any; onNext: () => void; onBack: () => void; canGoBack: boolean }) => {
 	return (
 		<div className="space-y-6">
+			<div className="flex items-center gap-4 mb-4">
+				{canGoBack && (
+					<button
+						onClick={onBack}
+						className="flex items-center gap-2 px-4 py-2 rounded-xl border border-void-border-3 bg-void-bg-3/40 text-void-fg-3 hover:text-void-fg-1 hover:border-void-border-2 transition-all"
+					>
+						<ChevronLeft className="w-4 h-4" />
+						Back
+					</button>
+				)}
+			</div>
 			<h2 className="text-3xl font-light text-void-fg-0 mb-4">Verification Results</h2>
 
 			<div className="space-y-3">
@@ -360,12 +465,23 @@ const VerificationResultsStep = ({ results, onNext }: { results: any; onNext: ()
 				/>
 			</div>
 
-			<button
-				onClick={onNext}
-				className="w-full mt-6 px-6 py-3 rounded-2xl bg-gradient-to-r from-[#0e70c0] to-[#6b5bff] text-white font-medium"
-			>
-				Continue
-			</button>
+			<div className="flex gap-4 mt-6">
+				{canGoBack && (
+					<button
+						onClick={onBack}
+						className="flex items-center gap-2 px-5 py-3 rounded-2xl border border-void-border-3 bg-void-bg-3/40 text-void-fg-3 hover:text-void-fg-1 hover:border-void-border-2 transition-all"
+					>
+						<ChevronLeft className="w-4 h-4" />
+						Back
+					</button>
+				)}
+				<button
+					onClick={onNext}
+					className="flex-1 px-6 py-3 rounded-2xl bg-gradient-to-r from-[#0e70c0] to-[#6b5bff] text-white font-medium"
+				>
+					Continue
+				</button>
+			</div>
 		</div>
 	);
 };
@@ -385,20 +501,33 @@ const ResultItem = ({ label, passed, skipped, error }: { label: string; passed: 
 	);
 };
 
-const DefaultsStep = ({ onComplete }: { onComplete: () => void }) => {
+const DefaultsStep = ({ onComplete, onBack, canGoBack }: { onComplete: () => void; onBack: () => void; canGoBack: boolean }) => {
 	return (
-		<div className="space-y-6 text-center">
-			<Check className="w-16 h-16 text-emerald-400 mx-auto mb-4" />
-			<h2 className="text-3xl font-light text-void-fg-0 mb-4">Setup Complete!</h2>
-			<p className="text-void-fg-3 mb-8 max-w-2xl mx-auto">
-				Your local models are configured and ready to use. CortexIDE will use local models by default.
-			</p>
-			<button
-				onClick={onComplete}
-				className="px-8 py-4 rounded-2xl bg-gradient-to-r from-[#0e70c0] to-[#6b5bff] text-white font-medium text-lg"
-			>
-				Start using CortexIDE
-			</button>
+		<div className="space-y-6">
+			<div className="flex items-center gap-4 mb-4">
+				{canGoBack && (
+					<button
+						onClick={onBack}
+						className="flex items-center gap-2 px-4 py-2 rounded-xl border border-void-border-3 bg-void-bg-3/40 text-void-fg-3 hover:text-void-fg-1 hover:border-void-border-2 transition-all"
+					>
+						<ChevronLeft className="w-4 h-4" />
+						Back
+					</button>
+				)}
+			</div>
+			<div className="text-center">
+				<Check className="w-16 h-16 text-emerald-400 mx-auto mb-4" />
+				<h2 className="text-3xl font-light text-void-fg-0 mb-4">Setup Complete!</h2>
+				<p className="text-void-fg-3 mb-8 max-w-2xl mx-auto">
+					Your local models are configured and ready to use. CortexIDE will use local models by default.
+				</p>
+				<button
+					onClick={onComplete}
+					className="px-8 py-4 rounded-2xl bg-gradient-to-r from-[#0e70c0] to-[#6b5bff] text-white font-medium text-lg"
+				>
+					Start using CortexIDE
+				</button>
+			</div>
 		</div>
 	);
 };

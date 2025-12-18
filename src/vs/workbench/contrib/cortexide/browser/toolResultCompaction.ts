@@ -21,10 +21,19 @@ export interface ToolResultCompactionPolicy {
 }
 
 const DEFAULT_POLICY: ToolResultCompactionPolicy = {
-	maxCharsPerResult: 8000, // 8k default
+	maxCharsPerResult: 8000, // 8k default (will be overridden to 4k for local in agent mode)
 	keepFirstChars: 2000, // First 2k
 	keepLastChars: 2000, // Last 2k
 	enableForLocal: true,
+};
+
+/**
+ * Agent mode policy: more aggressive compaction for local models
+ */
+export const AGENT_MODE_LOCAL_POLICY: Partial<ToolResultCompactionPolicy> = {
+	maxCharsPerResult: 4000, // 4k for local models in agent mode (reduced from 8k)
+	keepFirstChars: 1500, // First 1.5k
+	keepLastChars: 1500, // Last 1.5k
 };
 
 /**

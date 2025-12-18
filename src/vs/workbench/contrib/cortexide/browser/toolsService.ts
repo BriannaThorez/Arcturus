@@ -56,43 +56,51 @@ const validateURI = (uriStr: unknown, workspaceContextService?: IWorkspaceContex
 	if (uriStr === null) throw new Error(`Invalid LLM output: uri was null.`)
 	if (typeof uriStr !== 'string') throw new Error(`Invalid LLM output format: Provided uri must be a string, but it's a(n) ${typeof uriStr}. Full value: ${JSON.stringify(uriStr)}.`)
 
+	// Strip quotes if the LLM included them (common mistake)
+	let cleanedUriStr = uriStr.trim()
+	if ((cleanedUriStr.startsWith('"') && cleanedUriStr.endsWith('"')) ||
+		(cleanedUriStr.startsWith("'") && cleanedUriStr.endsWith("'"))) {
+		cleanedUriStr = cleanedUriStr.slice(1, -1)
+	}
+
 	let uri: URI;
 	// Check if it's already a full URI with scheme (e.g., vscode-remote://, file://, etc.)
-	if (uriStr.includes('://')) {
+	if (cleanedUriStr.includes('://')) {
 		try {
-			uri = URI.parse(uriStr)
+			uri = URI.parse(cleanedUriStr)
 		} catch (e) {
-			throw new Error(`Invalid URI format: ${uriStr}. Error: ${e}`)
+			throw new Error(`Invalid URI format: ${cleanedUriStr}. Error: ${e}`)
 		}
 	} else {
 		// No scheme present, treat as file path
-		uri = URI.file(uriStr);
+		uri = URI.file(cleanedUriStr);
 
 		// If we have a workspace and the path is relative (doesn't start with /), resolve it
-		if (workspaceContextService && !uriStr.startsWith('/')) {
+		if (workspaceContextService && !cleanedUriStr.startsWith('/')) {
 			const workspace = workspaceContextService.getWorkspace();
 			if (workspace.folders.length > 0) {
 				// Resolve relative path against workspace root
-				uri = joinPath(workspace.folders[0].uri, uriStr);
+				uri = joinPath(workspace.folders[0].uri, cleanedUriStr);
 			}
 		}
 		// If path is absolute (starts with /), check if it's actually within workspace
 		// This handles cases where LLM returns paths like "/carepilot-api/src" that should be relative
-		else if (workspaceContextService && uriStr.startsWith('/')) {
+		else if (workspaceContextService && cleanedUriStr.startsWith('/')) {
 			const workspace = workspaceContextService.getWorkspace();
 			for (const folder of workspace.folders) {
 				const workspacePath = folder.uri.fsPath;
 				// Check if the absolute path is actually within this workspace folder
 				// by checking if workspace path is a prefix
-				if (uriStr.startsWith(workspacePath)) {
+				if (cleanedUriStr.startsWith(workspacePath)) {
 					// Path is already correctly absolute within workspace
+					uri = URI.file(cleanedUriStr);
 					break;
 				}
 				// Check if path starts with workspace folder name (common LLM mistake)
 				const workspaceFolderName = folder.name || folder.uri.path.split('/').pop() || '';
-				if (uriStr.startsWith(`/${workspaceFolderName}/`) || uriStr === `/${workspaceFolderName}`) {
+				if (cleanedUriStr.startsWith(`/${workspaceFolderName}/`) || cleanedUriStr === `/${workspaceFolderName}`) {
 					// Treat as relative path - remove leading slash and folder name
-					const relativePath = uriStr.replace(`/${workspaceFolderName}`, '').replace(/^\//, '');
+					const relativePath = cleanedUriStr.replace(`/${workspaceFolderName}`, '').replace(/^\//, '');
 					uri = joinPath(folder.uri, relativePath);
 					break;
 				}
@@ -189,7 +197,7 @@ export class ToolsService implements IToolsService {
 	public stringOfResult: BuiltinToolResultToString;
 
 	private readonly _webSearchCache = new LRUCache<string, { results: Array<{ title: string, snippet: string, url: string }>, timestamp: number }>(100);
-	private readonly _browseCache = new LRUCache<string, { content: string, title?: string, url: string, metadata?: { publishedDate?: string }, timestamp: number }>(100);
+	private readonly _browseCache = new LRUCache<string, { content: string, title?: string, url: string, metadata?: { publishedDate?: string; links?: Array<{ url: string; text: string }> }, timestamp: number, _etag?: string, _lastModified?: string }>(100);
 	private readonly _cacheTTL = 60 * 60 * 1000; // 1 hour
 	private readonly _offlineGate: OfflinePrivacyGate;
 

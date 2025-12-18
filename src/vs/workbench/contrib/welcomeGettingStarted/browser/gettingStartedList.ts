@@ -73,8 +73,10 @@ export class GettingStartedIndexList<T extends { id: string; when?: ContextKeyEx
 		this.scrollbar.scanDomNode();
 	}
 
-	onDidChange(listener: () => void) {
-		this._register(this.onDidChangeEntries(listener));
+	onDidChange(listener: () => void): IDisposable {
+		const disposable = this.onDidChangeEntries(listener);
+		this.register(disposable);
+		return disposable;
 	}
 
 	register(d: IDisposable) { if (this.isDisposed) { d.dispose(); } else { this._register(d); } }

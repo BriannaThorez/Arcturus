@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *---------------------------------------------------------------------------------------------*/
 
-import { Disposable } from '../../../../base/common/lifecycle.js';
+import { Disposable, IDisposable } from '../../../../base/common/lifecycle.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
@@ -284,8 +284,9 @@ export class LocalSetupService extends Disposable implements ILocalSetupService 
 
 		const cancellationToken = token || CancellationToken.None;
 		this.cancellationTokenSource = new CancellationTokenSource();
+		let parentTokenDisposable: IDisposable | undefined;
 		if (token) {
-			token.onCancellationRequested(() => this.cancellationTokenSource?.cancel());
+			parentTokenDisposable = token.onCancellationRequested(() => this.cancellationTokenSource?.cancel());
 		}
 
 		try {
@@ -322,6 +323,8 @@ export class LocalSetupService extends Disposable implements ILocalSetupService 
 			};
 			this._setState({ type: 'error', error: errorObj });
 			throw error;
+		} finally {
+			parentTokenDisposable?.dispose();
 		}
 	}
 
@@ -332,10 +335,12 @@ export class LocalSetupService extends Disposable implements ILocalSetupService 
 
 		return new Promise((resolve, reject) => {
 			const controller = new AbortController();
+			let cancellationDisposable: IDisposable | undefined;
 			if (token.isCancellationRequested) {
 				controller.abort();
+			} else {
+				cancellationDisposable = token.onCancellationRequested(() => controller.abort());
 			}
-			token.onCancellationRequested(() => controller.abort());
 
 			fetch(url, {
 				method: 'POST',
@@ -381,9 +386,11 @@ export class LocalSetupService extends Disposable implements ILocalSetupService 
 						}
 					}
 
+					cancellationDisposable?.dispose();
 					resolve();
 				})
 				.catch((error) => {
+					cancellationDisposable?.dispose();
 					if (error.name === 'AbortError') {
 						reject(new Error('Download cancelled'));
 					} else {

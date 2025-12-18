@@ -30,6 +30,17 @@ import { IModelWarmupService } from '../common/modelWarmupService.js';
 const allLinebreakSymbols = ['\r\n', '\n'];
 const _ln = isWindows ? allLinebreakSymbols[0] : allLinebreakSymbols[1];
 
+// Helper function for request deduplication
+function hashString(str: string): string {
+	let hash = 0;
+	for (let i = 0; i < str.length; i++) {
+		const char = str.charCodeAt(i);
+		hash = ((hash << 5) - hash) + char;
+		hash = hash & hash; // Convert to 32bit integer
+	}
+	return Math.abs(hash).toString(36);
+}
+
 // The extension this was called from is here - https://github.com/voideditor/void/blob/autocomplete/extensions/void/src/extension/extension.ts
 
 
@@ -639,6 +650,13 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 	private _lastCompletionAccept = 0
 	// private _lastPrefix: string = ''
 
+	// Request deduplication cache for local models
+	// Prevents duplicate requests for identical prefix/suffix within 100ms window
+	private readonly _requestDeduplicationCache: Map<string, { promise: Promise<Autocompletion>, timestamp: number }> = new Map();
+	private readonly REQUEST_DEDUP_WINDOW_MS = 100; // 100ms deduplication window
+	private readonly REQUEST_DEDUP_CLEANUP_INTERVAL_MS = 5000; // Clean up old entries every 5s
+	private _lastDedupCleanup = Date.now();
+
 	// used internally by vscode
 	// fires after every keystroke and returns the completion to show
 	async _provideInlineCompletionItems(
@@ -781,7 +799,6 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 			}
 		}
 
-
 		// gather relevant context from the code around the user's selection and definitions
 		// const relevantSnippetsList = await this._contextGatheringService.readCachedSnippets(model, position, 3);
 		// const relevantSnippetsList = this._contextGatheringService.getCachedSnippets();
@@ -797,6 +814,47 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 			: false
 
 		const { shouldGenerate, predictionType, llmPrefix, llmSuffix, stopTokens } = getCompletionOptions(prefixAndSuffix, relevantContext, justAcceptedAutocompletion, isLocal)
+
+		// Request deduplication for local models: Check if identical request was made recently
+		// This prevents duplicate requests when user types fast or when multiple autocomplete triggers occur
+		if (isLocal && shouldGenerate) {
+			// Clean up old deduplication entries periodically
+			const now = Date.now();
+			if (now - this._lastDedupCleanup > this.REQUEST_DEDUP_CLEANUP_INTERVAL_MS) {
+				for (const [key, entry] of this._requestDeduplicationCache.entries()) {
+					if (now - entry.timestamp > this.REQUEST_DEDUP_CLEANUP_INTERVAL_MS) {
+						this._requestDeduplicationCache.delete(key);
+					}
+				}
+				this._lastDedupCleanup = now;
+			}
+
+			// Create deduplication key from prefix, suffix, and model
+			const dedupKey = `${modelSelection?.providerName}:${modelSelection?.modelName}:${hashString(llmPrefix.substring(0, 500))}:${hashString(llmSuffix.substring(0, 500))}`;
+			const existingRequest = this._requestDeduplicationCache.get(dedupKey);
+
+			if (existingRequest && (now - existingRequest.timestamp) < this.REQUEST_DEDUP_WINDOW_MS) {
+				// Duplicate request detected within window - reuse existing promise
+				console.debug('[Autocomplete] Request deduplication: reusing existing request');
+				try {
+					const existingAutocompletion = await existingRequest.promise;
+					// Check if the existing completion matches our current prefix
+					const matchup = getAutocompletionMatchup({ prefix, autocompletion: existingAutocompletion });
+					if (matchup !== undefined) {
+						const inlineCompletions = toInlineCompletions({
+							autocompletionMatchup: matchup,
+							autocompletion: existingAutocompletion,
+							prefixAndSuffix,
+							position
+						});
+						return inlineCompletions;
+					}
+				} catch (e) {
+					// If existing request failed, continue with new request
+					console.debug('[Autocomplete] Deduplicated request failed, creating new request:', e);
+				}
+			}
+		}
 
 		if (!shouldGenerate) return []
 
@@ -830,6 +888,12 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 		// Warm up local model in background (fire-and-forget, doesn't block)
 		if (modelSelection && modelSelection.providerName !== 'auto' && modelSelection.modelName !== 'auto') {
 			this._modelWarmupService.warmupModelIfNeeded(modelSelection.providerName, modelSelection.modelName, featureName)
+		}
+
+		// Store completion promise in deduplication cache for local models
+		let dedupKey: string | undefined;
+		if (isLocal) {
+			dedupKey = `${modelSelection?.providerName}:${modelSelection?.modelName}:${hashString(llmPrefix.substring(0, 500))}:${hashString(llmSuffix.substring(0, 500))}`;
 		}
 
 		// set parameters of `newAutocompletion` appropriately
@@ -889,15 +953,31 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 						newAutocompletion.insertText = _ln + newAutocompletion.insertText
 					}
 
+					// Store in deduplication cache for local models (so future identical requests can reuse)
+					if (isLocal && dedupKey) {
+						const completionPromise = Promise.resolve(newAutocompletion);
+						this._requestDeduplicationCache.set(dedupKey, { promise: completionPromise, timestamp: Date.now() });
+					}
+
 					resolve(newAutocompletion.insertText)
 
 				},
 				onError: ({ message }) => {
 					newAutocompletion.endTime = Date.now()
 					newAutocompletion.status = 'error'
+					// Remove from deduplication cache on error
+					if (isLocal && dedupKey) {
+						this._requestDeduplicationCache.delete(dedupKey);
+					}
 					reject(message)
 				},
-				onAbort: () => { reject('Aborted autocomplete') },
+				onAbort: () => {
+					// Remove from deduplication cache on abort
+					if (isLocal && dedupKey) {
+						this._requestDeduplicationCache.delete(dedupKey);
+					}
+					reject('Aborted autocomplete')
+				},
 			})
 			newAutocompletion.requestId = requestId
 

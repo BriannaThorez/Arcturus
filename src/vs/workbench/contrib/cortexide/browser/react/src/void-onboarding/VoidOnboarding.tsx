@@ -380,12 +380,17 @@ const NextButton = ({ onClick, ...props }: { onClick: () => void } & React.Butto
 	)
 }
 
-const PreviousButton = ({ onClick, ...props }: { onClick: () => void } & React.ButtonHTMLAttributes<HTMLButtonElement>) => {
+const PreviousButton = ({ onClick, disabled, ...props }: { onClick: () => void; disabled?: boolean } & React.ButtonHTMLAttributes<HTMLButtonElement>) => {
 	return (
 		<button
 			type="button"
-			onClick={onClick}
-			className="px-5 py-2.5 rounded-2xl border border-white/15 bg-white/5 text-white/70 hover:text-white hover:border-white/40 hover:bg-white/10 transition-all duration-200"
+			onClick={disabled ? undefined : onClick}
+			disabled={disabled}
+			className={`px-5 py-2.5 rounded-2xl border border-white/15 bg-white/5 transition-all duration-200 ${
+				disabled
+					? 'text-white/35 cursor-not-allowed'
+					: 'text-white/70 hover:text-white hover:border-white/40 hover:bg-white/10'
+			}`}
 			{...props}
 		>
 			Back
@@ -578,7 +583,6 @@ const VoidOnboardingContent = () => {
 	const voidMetricsService = accessor.get('IMetricsService')
 
 	const voidSettingsState = useSettingsState()
-	const accessor = useAccessor()
 	const localSetupService = accessor.get('ILocalSetupService')
 
 	const [pageIndex, setPageIndex] = useState(0)
@@ -639,6 +643,7 @@ const VoidOnboardingContent = () => {
 		<div className="flex items-center gap-2">
 			<PreviousButton
 				onClick={() => { setPageIndex(pageIndex - 1) }}
+				disabled={pageIndex === 0}
 			/>
 			<NextButton
 				onClick={() => { setPageIndex(pageIndex + 1) }}
@@ -651,6 +656,7 @@ const VoidOnboardingContent = () => {
 		<div className="flex items-center gap-2">
 			<PreviousButton
 				onClick={() => { setPageIndex(pageIndex - 1) }}
+				disabled={pageIndex === 0}
 			/>
 			<SecondaryActionButton onClick={() => skipOnboarding('final-step-skip')}>Skip for now</SecondaryActionButton>
 			<PrimaryActionButton
@@ -706,7 +712,7 @@ const VoidOnboardingContent = () => {
 
 	// Check if we should show local wizard on first run
 	useEffect(() => {
-		if (!isOnboardingComplete && pageIndex === 0) {
+		if (!voidSettingsState.globalSettings.isOnboardingComplete && pageIndex === 0) {
 			// Check if user has local models configured
 			const hasLocalModels = voidSettingsState.settingsOfProvider.ollama.models.length > 0 ||
 				voidSettingsState.settingsOfProvider.vLLM.models.length > 0 ||
@@ -718,7 +724,7 @@ const VoidOnboardingContent = () => {
 				// Don't auto-show, let user choose in WelcomePage
 			}
 		}
-	}, [isOnboardingComplete, pageIndex, voidSettingsState, localSetupService]);
+	}, [pageIndex, voidSettingsState, localSetupService]);
 
 	const contentOfIdx: { [pageIndex: number]: React.ReactNode } = {
 		0: <WelcomePage
@@ -732,6 +738,19 @@ const VoidOnboardingContent = () => {
 		1: <OnboardingPageShell hasMaxWidth={false}
 			content={
 				<AddProvidersPage pageIndex={pageIndex} setPageIndex={setPageIndex} />
+			}
+			bottom={
+				<div className="max-w-[600px] w-full mx-auto flex flex-col items-end">
+					<div className="flex items-center gap-2">
+						<PreviousButton
+							onClick={() => { setPageIndex(pageIndex - 1) }}
+							disabled={pageIndex === 0}
+						/>
+						<NextButton
+							onClick={() => { setPageIndex(pageIndex + 1) }}
+						/>
+					</div>
+				</div>
 			}
 		/>,
 		2: <OnboardingPageShell

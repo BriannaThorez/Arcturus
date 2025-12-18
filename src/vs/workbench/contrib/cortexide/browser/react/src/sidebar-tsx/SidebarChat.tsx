@@ -253,12 +253,65 @@ export const IconWarning = ({
 	);
 };
 
+// Spinner component with smooth CSS animation
+const Spinner = ({ className = "", size = 14 }: { className?: string; size?: number }) => {
+	return (
+		<svg
+			className={`animate-spin ${className}`}
+			width={size}
+			height={size}
+			viewBox="0 0 24 24"
+			fill="none"
+			xmlns="http://www.w3.org/2000/svg"
+			aria-hidden="true"
+		>
+			<circle
+				cx="12"
+				cy="12"
+				r="10"
+				stroke="currentColor"
+				strokeWidth="2.5"
+				strokeLinecap="round"
+				strokeDasharray="31.416"
+				strokeDashoffset="31.416"
+				opacity="0.25"
+			/>
+			<circle
+				cx="12"
+				cy="12"
+				r="10"
+				stroke="currentColor"
+				strokeWidth="2.5"
+				strokeLinecap="round"
+				strokeDasharray="31.416"
+				strokeDashoffset="23.562"
+				opacity="0.75"
+			/>
+		</svg>
+	);
+};
+
+// Pulsing dots animation for a softer loading indicator
+const PulsingDots = ({ className = "" }: { className?: string }) => {
+	return (
+		<div className={`inline-flex items-center gap-1 ${className}`} aria-hidden="true">
+			<span className="w-1 h-1 rounded-full bg-current opacity-40 animate-pulse" style={{ animationDelay: "0ms" }} />
+			<span className="w-1 h-1 rounded-full bg-current opacity-60 animate-pulse" style={{ animationDelay: "150ms" }} />
+			<span className="w-1 h-1 rounded-full bg-current opacity-80 animate-pulse" style={{ animationDelay: "300ms" }} />
+		</div>
+	);
+};
+
 export const IconLoading = ({
 	className = "",
 	showTokenCount,
+	showSpinner = false,
+	size = 14,
 }: {
 	className?: string;
 	showTokenCount?: number;
+	showSpinner?: boolean;
+	size?: number;
 }) => {
 	const [dots, setDots] = useState(1);
 
@@ -285,9 +338,15 @@ export const IconLoading = ({
 		showTokenCount !== undefined ? ` (${showTokenCount} tokens)` : "";
 
 	return (
-		<div className={`${className}`}>
-			{dotsText}
-			{tokenText}
+		<div className={`${className} inline-flex items-center gap-1.5`}>
+			{showSpinner ? (
+				<Spinner className="text-current" size={size} />
+			) : (
+				<PulsingDots className="opacity-70" />
+			)}
+			{tokenText && (
+				<span className="opacity-70 text-[11px]">{tokenText}</span>
+			)}
 		</div>
 	);
 };
@@ -5783,6 +5842,70 @@ export const SidebarChat = () => {
 	// Only show stop button when actively running (LLM, tool, preparing), not when idle
 	const isActivelyStreaming =
 		isRunning === "LLM" || isRunning === "tool" || isRunning === "preparing";
+
+	const activityStatus = useMemo(() => {
+		if (!isActivelyStreaming) {
+			return null;
+		}
+
+		// Prefer explicit status text from the stream state when preparing
+		if (isRunning === "preparing") {
+			const primary =
+				displayContentSoFar && displayContentSoFar.trim().length > 0
+					? displayContentSoFar
+					: "Preparing your request…";
+			return { primary, secondary: undefined as string | undefined };
+		}
+
+		// Tool phase – surface which tool is running when possible
+		if (isRunning === "tool" || toolIsGenerating) {
+			let toolLabel = "Running tools…";
+			if (toolCallSoFar?.name) {
+				toolLabel = `Running tool: ${toolCallSoFar.name}`;
+			}
+			return {
+				primary: toolLabel,
+				secondary: "Applying changes and reading from your project.",
+			};
+		}
+
+		// LLM phase – distinguish thinking vs. writing
+		if (isRunning === "LLM") {
+			if (!displayContentSoFar && !reasoningSoFar) {
+				return {
+					primary: "Thinking through your request…",
+					secondary: "Analyzing your code, context, and instructions.",
+				};
+			}
+
+			if (reasoningSoFar && !displayContentSoFar) {
+				return {
+					primary: "Planning the best set of changes…",
+					secondary: undefined,
+				};
+			}
+
+			if (displayContentSoFar) {
+				return {
+					primary: "Writing the answer…",
+					secondary: undefined,
+				};
+			}
+		}
+
+		return {
+			primary: "Working on your request…",
+			secondary: undefined,
+		};
+	}, [
+		isActivelyStreaming,
+		isRunning,
+		displayContentSoFar,
+		reasoningSoFar,
+		toolIsGenerating,
+		toolCallSoFar,
+	]);
+
 	const currStreamingMessageHTML =
 		isActivelyStreaming && (reasoningSoFar || displayContentSoFar) ? (
 			<ChatBubble
@@ -5828,19 +5951,35 @@ export const SidebarChat = () => {
 			{/* Generating tool */}
 			{generatingTool}
 
-			{/* loading indicator with token count */}
-			{isRunning === "LLM" || isRunning === "preparing" ? (
+			{/* Claude-style activity banner with spinner + loading indicator with token count */}
+			{activityStatus ? (
 				<ProseWrapper>
-					<IconLoading
-						className="opacity-50 text-sm"
-						showTokenCount={
-							// Only show token count when actively streaming (LLM)
-							// When isRunning is 'idle' or undefined, the message is complete and token count should stop
-							displayContentSoFar && isRunning === "LLM"
-								? Math.ceil(displayContentSoFar.length / 4)
-								: undefined
-						}
-					/>
+					<div className="mt-1 mb-2 inline-flex items-start gap-2.5 text-xs text-void-fg-3 transition-opacity duration-300 ease-in-out">
+						<div className="flex-shrink-0 mt-0.5">
+							<IconLoading
+								className="opacity-80"
+								showSpinner={true}
+								size={16}
+								showTokenCount={
+									// Only show token count when actively streaming (LLM)
+									// When isRunning is 'idle' or undefined, the message is complete and token count should stop
+									displayContentSoFar && isRunning === "LLM"
+										? Math.ceil(displayContentSoFar.length / 4)
+										: undefined
+								}
+							/>
+						</div>
+						<div className="flex flex-col gap-0.5 min-w-0">
+							<span className="font-medium text-void-fg-2 leading-tight">
+								{activityStatus.primary}
+							</span>
+							{activityStatus.secondary && (
+								<span className="text-void-fg-4 leading-tight text-[11px]">
+									{activityStatus.secondary}
+								</span>
+							)}
+						</div>
+					</div>
 				</ProseWrapper>
 			) : null}
 
@@ -6312,27 +6451,62 @@ export const SidebarChat = () => {
 
 	// Chat Tabs Bar Component - displays all threads as tabs
 	const ChatTabsBar = () => {
-		// Only show recent/active threads as tabs (limit to most recent 10)
-		// This prevents showing all historical chats as tabs on startup
-		const MAX_TABS_TO_SHOW = 10;
+		// Track threads that have been accessed in the current session
+		const accessedThreadsRef = useRef<Set<string>>(new Set());
+
+		// Update accessed threads when switching
+		useEffect(() => {
+			if (chatThreadsState.currentThreadId) {
+				accessedThreadsRef.current.add(chatThreadsState.currentThreadId);
+			}
+		}, [chatThreadsState.currentThreadId]);
+
+		// Only show threads that are actively being used, not all historical threads
+		// This prevents closed tabs from reappearing
+		const MAX_TABS_TO_SHOW = 12;
+		const now = Date.now();
+		const RECENT_THRESHOLD = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+
 		const allThreadIds = Object.keys(chatThreadsState.allThreads)
 			.filter((threadId) => {
 				const thread = chatThreadsState.allThreads[threadId];
+				if (!thread) return false;
+
 				// Always include the current thread
 				if (threadId === chatThreadsState.currentThreadId) return true;
+
 				// Only include threads that have messages (active chats)
-				return thread && thread.messages.length > 0;
+				if (thread.messages.length === 0) return false;
+
+				// Include threads accessed in current session
+				if (accessedThreadsRef.current.has(threadId)) return true;
+
+				// Include threads accessed recently (within last 24 hours)
+				const lastModified = new Date(thread.lastModified).getTime();
+				return (now - lastModified) < RECENT_THRESHOLD;
 			})
 			.sort((a, b) => {
 				const threadA = chatThreadsState.allThreads[a];
 				const threadB = chatThreadsState.allThreads[b];
 				if (!threadA || !threadB) return 0;
+
+				// Prioritize current thread
+				if (a === chatThreadsState.currentThreadId) return -1;
+				if (b === chatThreadsState.currentThreadId) return 1;
+
+				// Then prioritize threads accessed in session
+				const aAccessed = accessedThreadsRef.current.has(a);
+				const bAccessed = accessedThreadsRef.current.has(b);
+				if (aAccessed && !bAccessed) return -1;
+				if (!aAccessed && bAccessed) return 1;
+
+				// Finally sort by last modified
 				return (
 					new Date(threadB.lastModified).getTime() -
 					new Date(threadA.lastModified).getTime()
 				);
 			})
-			.slice(0, MAX_TABS_TO_SHOW); // Limit to most recent 10 tabs
+			.slice(0, MAX_TABS_TO_SHOW);
 
 		const getThreadTitle = (threadId: string) => {
 			const thread = chatThreadsState.allThreads[threadId];
@@ -6355,10 +6529,15 @@ export const SidebarChat = () => {
 					return;
 				}
 
+				// Remove from accessed threads set
+				accessedThreadsRef.current.delete(threadId);
+
 				// If this is the active tab, switch to another one first
 				if (threadId === chatThreadsState.currentThreadId) {
+					// Find the next available thread from all threads
 					const otherThreadId = allThreadIds.find((id) => id !== threadId);
 					if (otherThreadId) {
+						accessedThreadsRef.current.add(otherThreadId);
 						chatThreadsService.switchToThread(otherThreadId);
 					}
 				}
@@ -6372,7 +6551,7 @@ export const SidebarChat = () => {
 		return (
 			<div
 				className="w-full flex items-center border-b border-void-border-3/60 bg-void-bg-2 flex-shrink-0"
-				style={{ height: "48px" }}
+				style={{ height: "44px" }}
 			>
 				<div
 					className="flex items-center flex-1 min-w-0 overflow-x-auto scrollbar-thin scrollbar-thumb-void-border-3 scrollbar-track-transparent"
@@ -6383,7 +6562,6 @@ export const SidebarChat = () => {
 				>
 					{allThreadIds.map((threadId, index) => {
 						const isActive = threadId === chatThreadsState.currentThreadId;
-						const isLast = index === allThreadIds.length - 1;
 						const title = getThreadTitle(threadId);
 						const thread = chatThreadsState.allThreads[threadId];
 						const hasMessages = thread && thread.messages.length > 0;
@@ -6398,31 +6576,34 @@ export const SidebarChat = () => {
 								key={threadId}
 								className={`
 									group relative flex items-center gap-1.5 flex-shrink-0 whitespace-nowrap
-									px-4 py-2.5 text-xs
+									px-3.5 py-2 text-xs
 									transition-all duration-200 ease-out
-									${!isLast ? "border-r border-void-border-3/50" : ""}
+									cursor-pointer
 									${
 										isActive
-											? "bg-void-bg-1 text-void-fg-1 font-medium"
-											: "bg-transparent text-void-fg-3 hover:text-void-fg-2 hover:bg-void-bg-3/40"
+											? "bg-void-bg-1 text-void-fg-1 font-medium border-b-2 border-void-link-color"
+											: "bg-transparent text-void-fg-3 hover:text-void-fg-2 hover:bg-void-bg-3/50 border-b-2 border-transparent"
 									}
 								`}
 							>
 								<button
-									onClick={() => chatThreadsService.switchToThread(threadId)}
-									className="flex items-center gap-2 flex-1 min-w-0 outline-none focus-visible:ring-2 focus-visible:ring-void-link-color/50 focus-visible:ring-offset-1"
+									onClick={() => {
+										accessedThreadsRef.current.add(threadId);
+										chatThreadsService.switchToThread(threadId);
+									}}
+									className="flex items-center gap-2 flex-1 min-w-0 outline-none focus-visible:ring-2 focus-visible:ring-void-link-color/50 focus-visible:ring-offset-1 rounded-sm"
 									title={title}
 									type="button"
 								>
 									<span
-										className={`truncate max-w-[200px] ${isActive ? "text-void-fg-1" : "text-void-fg-3"}`}
+										className={`truncate max-w-[180px] ${isActive ? "text-void-fg-1" : "text-void-fg-3"}`}
 									>
 										{title}
 									</span>
 									{hasMessages && messageCount > 0 && (
 										<span
 											className={`
-											text-[10px] px-1.5 py-0.5 font-medium flex-shrink-0
+											text-[10px] px-1.5 py-0.5 rounded font-medium flex-shrink-0
 											${
 												isActive
 													? "bg-void-link-color/20 text-void-link-color"
@@ -6435,13 +6616,18 @@ export const SidebarChat = () => {
 										</span>
 									)}
 								</button>
-								{/* Close button - only show if there's more than one tab */}
+								{/* Close button - always visible on active tab, hover on others */}
 								{allThreadIds.length > 1 && (
 									<button
 										onClick={(e) => handleCloseTab(e, threadId)}
 										className={`
-											ml-0.5 p-1 flex items-center justify-center
-											opacity-0 group-hover:opacity-100 transition-all duration-200
+											ml-0.5 p-1.5 flex items-center justify-center rounded-sm
+											transition-all duration-200
+											${
+												isActive
+													? "opacity-70 hover:opacity-100"
+													: "opacity-0 group-hover:opacity-70"
+											}
 											text-void-fg-4 hover:text-void-fg-1
 											hover:bg-void-bg-3/60 active:bg-void-bg-3/80
 											outline-none focus-visible:opacity-100 focus-visible:ring-1 focus-visible:ring-void-link-color/50
@@ -6450,7 +6636,7 @@ export const SidebarChat = () => {
 										title={`Close ${title}`}
 										type="button"
 									>
-										<IconX size={11} className="stroke-[2.5]" />
+										<IconX size={12} className="stroke-[2.5]" />
 									</button>
 								)}
 							</div>

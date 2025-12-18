@@ -578,21 +578,36 @@ export const chat_systemMessage_local = ({ workspaceFolders, openedURIs, activeU
 	const header = mode === 'agent'
 		? 'Coding agent. Use tools for actions.'
 		: mode === 'gather'
-		? 'Code assistant. Search and reference files.'
-		: 'Code assistant.'
+			? 'Code assistant. Search and reference files.'
+			: 'Code assistant.'
 
 	const sysInfo = `System: ${os}\nWorkspace: ${workspaceFolders.join(', ') || 'none'}\nActive: ${activeURI || 'none'}\nOpen: ${openedURIs.slice(0, 3).join(', ') || 'none'}${openedURIs.length > 3 ? '...' : ''}`
 
 	const toolDefinitions = includeXMLToolDefinitions ? systemToolsXMLPrompt(mode, mcpTools) : null
 
 	const details: string[] = []
-	if (mode === 'agent') {
-		details.push('Use tools. Read files before answering.')
-	} else if (mode === 'gather') {
-		details.push('Use tools. One at a time.')
+
+	// CRITICAL: For local models, we need to be explicit about tool usage
+	// Local models often default to describing actions instead of using tools
+	if (includeXMLToolDefinitions) {
+		details.push('⚠️ IMPORTANT: When user asks you to DO something, call a tool using XML. DO NOT describe - ACTUALLY call the tool.')
+		details.push('Format: <tool_name><param>value</param></tool_name>')
+		details.push('PATH RULES: Use relative paths or empty string for root. For ls_dir, use empty string or relative path like "src" not full paths.')
+		details.push('Example: "how many endpoints?" → <search_for_files><query>api route endpoint</query></search_for_files>')
+		details.push('Example: "list files" → <ls_dir><uri></uri></ls_dir> (empty uri = root)')
+		details.push('Example: "read server.ts" → <read_file><uri>server.ts</uri></read_file> (relative path)')
+		details.push('NEVER use full absolute paths. Use relative paths or empty string for workspace root.')
 	}
 
-	const importantDetails = details.length > 0 ? `\n${details.join('\n')}` : ''
+	if (mode === 'agent') {
+		details.push('AGENT: Use tools for actions. Read files before answering. Stop after getting results - do not loop.')
+	} else if (mode === 'gather') {
+		details.push('GATHER: Use tools one at a time. Stop after getting results.')
+	} else {
+		details.push('For codebase questions, use tools to find answers. Stop after getting results.')
+	}
+
+	const importantDetails = details.length > 0 ? `\n\n${details.join('\n')}` : ''
 
 	const memoriesSection = relevantMemories ? `\n\n<memories>\n${relevantMemories.slice(0, 500)}${relevantMemories.length > 500 ? '...' : ''}\n</memories>` : ''
 
