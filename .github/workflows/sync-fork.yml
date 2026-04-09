@@ -1,0 +1,22 @@
+name: Scheduled Upstream Sync
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Runs every day at midnight UTC
+  workflow_dispatch:   # Allows you to click a button to sync manually
+
+jobs:
+  sync_latest_from_upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          # Use a Personal Access Token (PAT) if you want this sync to trigger other actions
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync upstream changes
+        # Replace 'main' with your default branch name if different
+        run: gh repo sync BriannaThorez/Arcturus -b main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
